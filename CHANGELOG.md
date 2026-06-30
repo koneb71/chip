@@ -22,7 +22,7 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) from 1.0 onwar
   HTTP/SSH clone, web browse, encryption at rest, and statelessness) and a
   `cargo-deny` dependency-audit job.
 
-## [0.1.0] — unreleased
+## [0.0.1]
 
 Initial release: a changeset-oriented version control system (a Git
 *alternative*) in Rust, with a deployable multi-user server.
@@ -60,5 +60,5 @@ Initial release: a changeset-oriented version control system (a Git
 - Cross-platform release binaries + installers via cargo-dist (macOS arm64/x64,
   Linux x64/arm64 musl, Windows x64).
 
-[Unreleased]: https://github.com/koneb71/chip/compare/v0.1.0...HEAD
-[0.1.0]: https://github.com/koneb71/chip/releases/tag/v0.1.0
+[Unreleased]: https://github.com/koneb71/chip/compare/v0.0.1...HEAD
+[0.0.1]: https://github.com/koneb71/chip/releases/tag/v0.0.1

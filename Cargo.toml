@@ -8,7 +8,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.0.1"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["chip contributors"]
@@ -17,8 +17,8 @@ authors = ["chip contributors"]
 repository = "https://github.com/koneb71/chip"
 
 [workspace.dependencies]
-chip-core = { path = "crates/chip-core", version = "0.1.0" }
-chip-proto = { path = "crates/chip-proto", version = "0.1.0" }
+chip-core = { path = "crates/chip-core", version = "0.0.1" }
+chip-proto = { path = "crates/chip-proto", version = "0.0.1" }
 
 # Hashing / compression / serialization
 blake3 = "1"
