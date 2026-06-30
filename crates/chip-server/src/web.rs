@@ -143,16 +143,20 @@ fn esc(s: &str) -> String {
 
 fn page(title: &str, user: Option<&User>, body: &str) -> Html<String> {
     let nav_user = match user {
-        Some(u) => format!(
-            "<a href=\"/settings/tokens\">Tokens</a>\
-             <a href=\"/settings/keys\">SSH keys</a>\
-             <span class=\"who\">{}</span>\
-             <form method=\"post\" action=\"/logout\" style=\"display:inline\">\
-             <button type=\"submit\" class=\"btn btn-ghost\">Log out</button></form>",
-            esc(&u.username)
-        ),
+        Some(u) => {
+            let initial = esc(&u.username.chars().next().unwrap_or('?').to_string());
+            format!(
+                "<a href=\"/settings/tokens\">Tokens</a>\
+                 <a href=\"/settings/keys\">SSH keys</a>\
+                 <span class=\"who\"><span class=\"ava\">{initial}</span>\
+                 <span class=\"uname\">{name}</span></span>\
+                 <form method=\"post\" action=\"/logout\" style=\"display:inline\">\
+                 <button type=\"submit\" class=\"btn btn-ghost btn-sm\">Log out</button></form>",
+                name = esc(&u.username)
+            )
+        }
         None => "<a href=\"/login\">Log in</a>\
-             <a class=\"btn btn-primary\" href=\"/register\">Sign up</a>"
+             <a class=\"btn btn-primary btn-sm\" href=\"/register\">Sign up</a>"
             .to_string(),
     };
     Html(format!(
@@ -164,8 +168,38 @@ fn page(title: &str, user: Option<&User>, body: &str) -> Html<String> {
          <a class=\"brand\" href=\"/\"><span class=\"logo\">◆</span> chip</a>\
          <nav class=\"nav-links\"><a href=\"/docs\">Docs</a>{nav_user}</nav>\
          </div></header>\
-         <main class=\"container fade-up\">{body}</main></body></html>"
+         <main class=\"container fade-up\">{body}</main>\
+         <footer class=\"foot\"><div class=\"foot-inner\">\
+         <span>chip · a changeset-oriented version control system</span>\
+         <span><a href=\"/docs\">Docs</a> · \
+         <a href=\"https://github.com/koneb71/chip\">GitHub</a></span>\
+         </div></footer></body></html>"
     ))
+}
+
+/// A page header: title (left, with optional subtitle) + right-aligned actions.
+/// `title`/`subtitle`/`actions` are caller-escaped HTML fragments.
+fn page_head(title: &str, subtitle: &str, actions: &str) -> String {
+    let sub = if subtitle.is_empty() {
+        String::new()
+    } else {
+        format!("<p class=\"sub\">{subtitle}</p>")
+    };
+    format!(
+        "<div class=\"page-head\"><div><h1>{title}</h1>{sub}</div>\
+         <div class=\"actions\">{actions}</div></div>"
+    )
+}
+
+/// The Settings tab bar; `active` is "tokens" or "keys".
+fn settings_subnav(active: &str) -> String {
+    let cls = |n: &str| if n == active { " class=\"active\"" } else { "" };
+    format!(
+        "<nav class=\"subnav\"><a href=\"/settings/tokens\"{t}>API tokens</a>\
+         <a href=\"/settings/keys\"{k}>SSH keys</a></nav>",
+        t = cls("tokens"),
+        k = cls("keys")
+    )
 }
 
 /// Minimal black & white stylesheet for the whole web UI.
@@ -173,6 +207,7 @@ const CSS: &str = r#"
 :root{
   --ink:#111111;--ink-soft:#3a3a3a;--muted:#6b6b6b;
   --line:#e6e6e6;--bg:#ffffff;--surface:#ffffff;--soft:#f6f6f6;
+  --accent:#4f46e5;--accent-strong:#4338ca;--accent-soft:#eef2ff;--on-accent:#ffffff;
   --radius:14px;--shadow:0 4px 16px rgba(0,0,0,.06);--shadow-lg:0 10px 28px rgba(0,0,0,.12);
 }
 *{box-sizing:border-box}
@@ -184,10 +219,12 @@ h1{font-size:1.9rem;font-weight:700;letter-spacing:-.02em;margin:.2rem 0 1rem}
 h2{font-size:1.35rem;font-weight:700;letter-spacing:-.01em;margin:1.6rem 0 .6rem}
 h3{font-size:1.05rem;font-weight:600;margin:1.4rem 0 .5rem;color:var(--ink-soft)}
 p{margin:.5rem 0}
-a{color:var(--ink);text-decoration:none;transition:opacity .15s ease}
+a{color:var(--ink);text-decoration:none;transition:opacity .15s ease,color .15s ease}
 a:hover{opacity:.6}
 code{background:var(--soft);padding:.1rem .35rem;border-radius:6px;font-size:.85em}
 .muted{color:var(--muted)}
+.link,.prose a{color:var(--accent);font-weight:500}
+.link:hover,.prose a:hover{color:var(--accent-strong);opacity:1}
 
 /* nav */
 .nav{position:sticky;top:0;z-index:20;background:rgba(255,255,255,.85);
@@ -201,9 +238,12 @@ code{background:var(--soft);padding:.1rem .35rem;border-radius:6px;font-size:.85
 .nav-links{display:flex;align-items:center;gap:1.1rem}
 .nav-links a{color:var(--ink);font-weight:600;font-size:.95rem}
 .nav-links a:hover{opacity:.6}
-.nav-links a.btn-primary{color:#fff}
+.nav-links a.active{color:var(--accent)}
+.nav-links a.btn-primary{color:var(--on-accent)}
 .nav-links a.btn-primary:hover{opacity:1}
-.who{font-weight:600;color:var(--muted)}
+.who{display:inline-flex;align-items:center;gap:.45rem;font-weight:600;color:var(--muted)}
+.who .ava{display:inline-flex;align-items:center;justify-content:center;width:1.7rem;height:1.7rem;
+  flex:0 0 auto;border-radius:50%;background:var(--ink);color:#fff;font-size:.8rem;font-weight:700;text-transform:uppercase}
 
 /* layout */
 .container{max-width:960px;margin:0 auto;padding:2rem 1.25rem 4rem}
@@ -217,27 +257,37 @@ code{background:var(--soft);padding:.1rem .35rem;border-radius:6px;font-size:.85
 .repo-card{display:block;color:inherit}
 .repo-card:hover{opacity:1}
 .repo-card .name{font-weight:700;font-size:1.1rem;color:var(--ink)}
-.repo-card .desc{color:var(--ink-soft);font-size:.9rem;margin-top:.35rem}
-.repo-card .meta{color:var(--muted);font-size:.85rem;margin-top:.35rem}
+.repo-card .repo-ico{color:var(--accent)}
+.repo-card .desc{color:var(--ink-soft);font-size:.9rem;margin-top:.35rem;
+  display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.repo-card .meta{color:var(--muted);font-size:.85rem;margin-top:.55rem}
 /* new-repo form */
-.hint{font-size:.85rem;margin:.3rem 0 .1rem}
-.vis-cards{display:flex;flex-direction:column;gap:.6rem;margin:.4rem 0 .2rem}
-.vis-card{display:flex;align-items:flex-start;gap:.6rem;border:1px solid var(--line);
-  border-radius:var(--radius);padding:.7rem .9rem;cursor:pointer;transition:border-color .15s ease}
+.hint{font-size:.85rem;color:var(--muted);margin:.4rem 0 0}
+.hint code{font-size:.82rem}
+.vis-cards{display:flex;flex-direction:column;gap:.7rem;margin:.5rem 0 .2rem}
+.vis-card{display:flex;align-items:center;gap:.8rem;border:1px solid var(--line);
+  border-radius:var(--radius);padding:.85rem 1rem;cursor:pointer;
+  transition:border-color .15s ease,background .15s ease}
 .vis-card:hover{border-color:var(--ink-soft)}
-.vis-card:has(input:checked){border-color:var(--ink);box-shadow:0 0 0 1px var(--ink) inset}
-.vis-card input{margin-top:.25rem}
-.vis-card span{display:flex;flex-direction:column}
-.vis-card span span{font-size:.85rem;margin-top:.1rem}
+.vis-card:has(input:checked){border-color:var(--accent);background:var(--accent-soft);
+  box-shadow:0 0 0 1px var(--accent) inset}
+.vis-card input[type=radio]{width:1.1rem;height:1.1rem;flex:0 0 auto;margin:0;accent-color:var(--accent)}
+.vis-card .vc-text{display:flex;flex-direction:column;gap:.15rem}
+.vis-card .vc-text strong{font-size:.95rem}
+.vis-card .vc-text small{font-size:.83rem;color:var(--muted)}
 
 /* auth / narrow forms */
-.narrow{max-width:420px;margin:1.5rem auto}
+.narrow{max-width:430px;margin:1.5rem auto}
 form p{margin:.6rem 0}
-label{font-weight:600;font-size:.9rem;display:block;margin-bottom:.2rem}
-input,select{width:100%;font-size:1rem;padding:.7rem .85rem;border:1px solid #d4d4d4;
-  border-radius:12px;background:#fff;color:var(--ink);transition:border-color .15s,box-shadow .15s}
-input:focus,select:focus{outline:none;border-color:var(--ink);
-  box-shadow:0 0 0 3px rgba(0,0,0,.12)}
+label{font-weight:600;font-size:.9rem;display:block;margin-bottom:.25rem}
+input:not([type=radio]):not([type=checkbox]),select,textarea{width:100%;font-size:1rem;
+  font-family:inherit;padding:.7rem .85rem;border:1px solid #d4d4d4;border-radius:12px;
+  background:#fff;color:var(--ink);transition:border-color .15s,box-shadow .15s}
+input:focus,select:focus,textarea:focus{outline:none;border-color:var(--accent);
+  box-shadow:0 0 0 3px var(--accent-soft)}
+textarea{min-height:6.5rem;resize:vertical;line-height:1.5}
+textarea.mono,input.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.9rem}
+::placeholder{color:#9a9a9a}
 
 /* buttons */
 button,.btn{display:inline-flex;align-items:center;justify-content:center;gap:.4rem;
@@ -246,7 +296,9 @@ button,.btn{display:inline-flex;align-items:center;justify-content:center;gap:.4
   transition:transform .12s ease,box-shadow .2s ease,background .2s ease,color .2s ease}
 button:hover,.btn:hover{background:#000;box-shadow:0 6px 16px rgba(0,0,0,.18)}
 button:active,.btn:active{transform:scale(.96)}
-.btn-primary{background:var(--ink);color:#fff;border-color:var(--ink)}
+button:focus-visible,.btn:focus-visible{outline:none;box-shadow:0 0 0 3px var(--accent-soft)}
+.btn-primary{background:var(--accent);color:var(--on-accent);border-color:var(--accent)}
+.btn-primary:hover{background:var(--accent-strong);border-color:var(--accent-strong)}
 .btn-ghost{background:transparent;color:var(--ink);border-color:var(--line);box-shadow:none}
 .btn-ghost:hover{background:var(--soft);color:var(--ink);box-shadow:none}
 .btn-sm{padding:.35rem .8rem;font-size:.82rem}
@@ -326,6 +378,67 @@ table.blob{width:100%;border-collapse:collapse;font-family:ui-monospace,Menlo,mo
 table.blob td{border:0;padding:.05rem .6rem;white-space:pre;vertical-align:top}
 table.blob td.ln{width:1%;text-align:right;color:#b0b0b0;background:#fbfbfb;border-right:1px solid var(--line);user-select:none}
 table.blob tr:hover{background:var(--soft)}
+
+/* page header (title + actions) */
+.page-head{display:flex;align-items:flex-start;justify-content:space-between;gap:1rem;
+  flex-wrap:wrap;margin-bottom:.4rem}
+.page-head h1{margin:.1rem 0}
+.page-head .sub{color:var(--muted);margin:.1rem 0 0}
+.page-head .actions{display:flex;gap:.6rem;align-items:center;flex-shrink:0}
+
+/* settings sub-nav */
+.subnav{display:flex;gap:.4rem;border-bottom:1px solid var(--line);margin:1.1rem 0 1.6rem}
+.subnav a{padding:.5rem .9rem;font-weight:600;font-size:.92rem;color:var(--muted);
+  border-bottom:2px solid transparent;margin-bottom:-1px;border-radius:8px 8px 0 0}
+.subnav a:hover{color:var(--ink);opacity:1;background:var(--soft)}
+.subnav a.active{color:var(--accent);border-bottom-color:var(--accent)}
+
+/* generic list (settings rows, etc.) */
+.list{border:1px solid var(--line);border-radius:14px;overflow:hidden;box-shadow:var(--shadow)}
+.list-row{display:flex;align-items:center;gap:1rem;padding:.85rem 1.1rem;
+  border-bottom:1px solid var(--line)}
+.list-row:last-child{border-bottom:0}
+.list-row .lr-main{flex:1 1 auto;min-width:0}
+.list-row .lr-name{font-weight:600}
+.list-row .lr-sub{font-size:.82rem;color:var(--muted);margin-top:.1rem;
+  font-family:ui-monospace,Menlo,monospace;overflow:hidden;text-overflow:ellipsis}
+.list-row .lr-meta{flex:0 0 auto;font-size:.82rem;color:var(--muted);text-align:right}
+.list-row form{margin:0}
+.list-head{font-size:.78rem;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);
+  font-weight:700;margin:0 0 .6rem}
+
+/* prose (docs) */
+.prose{max-width:720px}
+.prose h2{border-top:1px solid var(--line);padding-top:1.4rem}
+.prose h2:first-of-type{border-top:0;padding-top:0}
+.prose ul,.prose ol{padding-left:1.2rem}
+.prose li{margin:.3rem 0}
+
+/* token reveal */
+.reveal{display:flex;align-items:center;gap:.6rem;background:var(--soft);
+  border:1px solid var(--line);border-radius:12px;padding:.55rem .55rem .55rem .9rem;
+  font-family:ui-monospace,Menlo,monospace;font-size:.9rem;word-break:break-all}
+.reveal code{background:none;padding:0;flex:1 1 auto}
+
+/* centered single-card pages (auth, 404) */
+.center{min-height:60vh;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center}
+.center .card{width:100%;text-align:left}
+
+/* footer */
+.foot{border-top:1px solid var(--line);margin-top:2.5rem}
+.foot-inner{max-width:960px;margin:0 auto;padding:1.4rem 1.25rem;display:flex;gap:1rem;
+  flex-wrap:wrap;align-items:center;justify-content:space-between;color:var(--muted);font-size:.85rem}
+.foot a{color:var(--muted);font-weight:600}.foot a:hover{color:var(--ink);opacity:1}
+
+@media (max-width:560px){
+  .container{padding:1.4rem 1rem 3rem}
+  .nav-inner{flex-wrap:wrap;gap:.3rem .8rem;padding:.65rem 1rem}
+  .nav-links{gap:.85rem;font-size:.9rem;flex-wrap:wrap}
+  .nav-links a,.who{white-space:nowrap}
+  .who .uname{display:none}
+  .page-head{flex-direction:column}
+  .narrow{margin:.5rem auto}
+}
 
 /* entrance animation */
 @keyframes fadeUp{from{opacity:0;transform:translateY(14px)}to{opacity:1;transform:none}}
@@ -430,7 +543,12 @@ and pushes are fast-forward unless forced.</p>
 "#
     );
 
-    page("docs", user.as_ref(), &body).into_response()
+    page(
+        "docs",
+        user.as_ref(),
+        &format!("<div class=\"prose\">{body}</div>"),
+    )
+    .into_response()
 }
 
 async fn index(State(state): State<AppState>, headers: HeaderMap) -> Response {
@@ -440,21 +558,28 @@ async fn index(State(state): State<AppState>, headers: HeaderMap) -> Response {
         .list_visible_repos(user.as_ref().map(|u| u.id))
         .await
         .unwrap_or_default();
-    let mut body = String::from(
-        "<div style=\"display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:1rem\">\
-         <h1 style=\"margin:0\">Repositories</h1>",
+    let actions = if user.is_some() {
+        "<a class=\"btn btn-primary\" href=\"/new\">+ New repository</a>"
+    } else {
+        ""
+    };
+    let mut body = page_head(
+        "Repositories",
+        "Browse and manage repositories hosted on this server.",
+        actions,
     );
-    if user.is_some() {
-        body.push_str("<a class=\"btn btn-primary\" href=\"/new\">+ New repository</a>");
-    }
-    body.push_str("</div>");
 
     if repos.is_empty() {
-        body.push_str(
-            "<div class=\"card\" style=\"text-align:center;margin-top:1.5rem\">\
-             <p style=\"font-size:1.1rem;font-weight:600\">No repositories yet</p>\
-             <p class=\"muted\">Create one to start pushing changes.</p></div>",
-        );
+        let cta = if user.is_some() {
+            "<p style=\"margin-top:1rem\"><a class=\"btn btn-primary\" href=\"/new\">Create a repository</a></p>"
+        } else {
+            "<p class=\"muted\">Nothing public to show yet. <a class=\"link\" href=\"/login\">Log in</a> to create one.</p>"
+        };
+        body.push_str(&format!(
+            "<div class=\"empty\" style=\"padding:2.4rem\">\
+             <p style=\"font-size:1.1rem;font-weight:600;color:var(--ink)\">No repositories yet</p>\
+             <p class=\"muted\">Repositories you own, collaborate on, or that are public appear here.</p>{cta}</div>"
+        ));
     } else {
         body.push_str("<div class=\"cards\">");
         for r in repos {
@@ -466,11 +591,11 @@ async fn index(State(state): State<AppState>, headers: HeaderMap) -> Response {
             let desc = if r.description.trim().is_empty() {
                 String::new()
             } else {
-                format!("<div class=\"desc muted\">{}</div>", esc(&r.description))
+                format!("<div class=\"desc\">{}</div>", esc(&r.description))
             };
             body.push_str(&format!(
                 "<a class=\"card repo-card\" href=\"/{0}/{1}\">\
-                 <div class=\"name\">{0}/{1}</div>{3}\
+                 <div class=\"name\"><span class=\"repo-ico\">◆</span> {0}/{1}</div>{3}\
                  <div class=\"meta\">{2}</div></a>",
                 esc(&r.owner),
                 esc(&r.name),
@@ -485,12 +610,12 @@ async fn index(State(state): State<AppState>, headers: HeaderMap) -> Response {
 
 async fn login_form(State(state): State<AppState>, headers: HeaderMap) -> Response {
     let user = current_user(&state, &headers).await;
-    let body = "<div class=\"card narrow\"><h1>Welcome back</h1>\
+    let body = "<div class=\"center\"><div class=\"card narrow\"><h1>Welcome back</h1>\
         <p class=\"muted\">Log in to your chip account.</p><form method=\"post\">\
-        <p><label>Username</label><input name=\"username\" placeholder=\"username\" required></p>\
-        <p><label>Password</label><input name=\"password\" type=\"password\" placeholder=\"password\" required></p>\
-        <button type=\"submit\" class=\"btn-primary\" style=\"width:100%;margin-top:.5rem\">Log in</button></form>\
-        <p class=\"muted\" style=\"margin-top:1rem;text-align:center\">New here? <a href=\"/register\">Create an account</a></p></div>";
+        <p><label>Username</label><input name=\"username\" placeholder=\"username\" autocomplete=\"username\" autofocus required></p>\
+        <p><label>Password</label><input name=\"password\" type=\"password\" placeholder=\"••••••••\" autocomplete=\"current-password\" required></p>\
+        <button type=\"submit\" class=\"btn-primary\" style=\"width:100%;margin-top:.6rem\">Log in</button></form>\
+        <p class=\"muted\" style=\"margin-top:1.1rem;text-align:center\">New here? <a class=\"link\" href=\"/register\">Create an account</a></p></div></div>";
     page("login", user.as_ref(), body).into_response()
 }
 
@@ -544,13 +669,13 @@ struct Registration {
 
 async fn register_form(State(state): State<AppState>, headers: HeaderMap) -> Response {
     let user = current_user(&state, &headers).await;
-    let body = "<div class=\"card narrow\"><h1>Create your account</h1>\
+    let body = "<div class=\"center\"><div class=\"card narrow\"><h1>Create your account</h1>\
         <p class=\"muted\">Host and sync repositories with chip.</p><form method=\"post\">\
-        <p><label>Username</label><input name=\"username\" placeholder=\"letters, digits, - or _\" required></p>\
-        <p><label>Email</label><input name=\"email\" type=\"email\" placeholder=\"you@example.com\" required></p>\
-        <p><label>Password</label><input name=\"password\" type=\"password\" placeholder=\"at least 8 characters\" required></p>\
-        <button type=\"submit\" class=\"btn-primary\" style=\"width:100%;margin-top:.5rem\">Create account</button></form>\
-        <p class=\"muted\" style=\"margin-top:1rem;text-align:center\">Already have an account? <a href=\"/login\">Log in</a></p></div>";
+        <p><label>Username</label><input name=\"username\" placeholder=\"letters, digits, - or _\" autocomplete=\"username\" autofocus required></p>\
+        <p><label>Email</label><input name=\"email\" type=\"email\" placeholder=\"you@example.com\" autocomplete=\"email\" required></p>\
+        <p><label>Password</label><input name=\"password\" type=\"password\" placeholder=\"at least 8 characters\" autocomplete=\"new-password\" required></p>\
+        <button type=\"submit\" class=\"btn-primary\" style=\"width:100%;margin-top:.6rem\">Create account</button></form>\
+        <p class=\"muted\" style=\"margin-top:1.1rem;text-align:center\">Already have an account? <a class=\"link\" href=\"/login\">Log in</a></p></div></div>";
     page("register", user.as_ref(), body).into_response()
 }
 
@@ -639,16 +764,16 @@ async fn new_repo_form(State(state): State<AppState>, headers: HeaderMap) -> Res
         <p><label>Repository name</label>\
         <input id=\"repo-name\" name=\"name\" placeholder=\"my-project\" \
          pattern=\"[A-Za-z0-9_-]{{1,64}}\" autocomplete=\"off\" autofocus required></p>\
-        <p class=\"hint muted\">Letters, digits, <code>-</code> or <code>_</code> · 1–64 characters.</p>\
-        <p class=\"hint muted\">Will be created at <code>{base}/{owner}/<span id=\"repo-url-name\">…</span></code></p>\
+        <p class=\"hint\">Letters, digits, hyphens, and underscores · 1–64 characters.</p>\
+        <p class=\"hint\">Will be created at <code>{base}/{owner}/<span id=\"repo-url-name\">…</span></code></p>\
         <p><label>Description <span class=\"muted\">(optional)</span></label>\
         <input name=\"description\" maxlength=\"{maxlen}\" placeholder=\"A short summary of this repository\"></p>\
         <label>Visibility</label>\
         <div class=\"vis-cards\">\
           <label class=\"vis-card\"><input type=\"radio\" name=\"visibility\" value=\"private\" checked>\
-            <span><strong>Private</strong><span class=\"muted\">Only you and collaborators can see it.</span></span></label>\
+            <span class=\"vc-text\"><strong>Private</strong><small>Only you and collaborators can see it.</small></span></label>\
           <label class=\"vis-card\"><input type=\"radio\" name=\"visibility\" value=\"public\">\
-            <span><strong>Public</strong><span class=\"muted\">Anyone can view it.</span></span></label>\
+            <span class=\"vc-text\"><strong>Public</strong><small>Anyone can view it.</small></span></label>\
         </div>\
         <button type=\"submit\" class=\"btn-primary\" style=\"width:100%;margin-top:1rem\">Create repository</button>\
         </form></div>\
@@ -707,27 +832,44 @@ async fn tokens_page(State(state): State<AppState>, headers: HeaderMap) -> Respo
     let csrf = csrf_of(&state, &headers);
     let csrf_field = csrf_input(csrf.as_deref());
     let mut body = format!(
-        "<h1>API tokens</h1><p class=\"muted\">Tokens authenticate the <code>chip</code> CLI.</p>\
-         <form method=\"post\">{csrf_field}<input name=\"name\" placeholder=\"token name\" required> \
-         <input name=\"expires_days\" type=\"number\" min=\"1\" placeholder=\"expires in N days (optional)\" style=\"width:16rem\"> \
-         <button type=\"submit\">Create token</button></form>\
-         <table><tr><td><strong>name</strong></td><td><strong>last used</strong></td>\
-         <td><strong>expires</strong></td><td></td></tr>",
+        "{head}{subnav}\
+         <div class=\"card\"><form method=\"post\" \
+         style=\"display:flex;gap:.7rem;flex-wrap:wrap;align-items:flex-end;margin:0\">{csrf_field}\
+         <div style=\"flex:1 1 14rem\"><label>Token name</label>\
+         <input name=\"name\" placeholder=\"my-laptop\" autocomplete=\"off\" required></div>\
+         <div style=\"flex:0 1 12rem\"><label>Expires (days)</label>\
+         <input name=\"expires_days\" type=\"number\" min=\"1\" placeholder=\"optional\"></div>\
+         <button type=\"submit\" class=\"btn-primary\">Create token</button></form></div>",
+        head = page_head(
+            "API tokens",
+            "Tokens authenticate the <code>chip</code> CLI over HTTP.",
+            ""
+        ),
+        subnav = settings_subnav("tokens"),
     );
-    for t in tokens {
-        body.push_str(&format!(
-            "<tr><td>{}</td><td class=\"muted\">{}</td><td class=\"muted\">{}</td>\
-             <td><form method=\"post\" action=\"/settings/tokens/revoke\">{}\
-             <input type=\"hidden\" name=\"name\" value=\"{}\">\
-             <button type=\"submit\">revoke</button></form></td></tr>",
-            esc(&t.name),
-            t.last_used.map(fmt_ts).unwrap_or_else(|| "never".into()),
-            t.expires_at.map(fmt_ts).unwrap_or_else(|| "never".into()),
-            csrf_field,
-            esc(&t.name)
-        ));
+    body.push_str("<p class=\"list-head\">Your tokens</p>");
+    if tokens.is_empty() {
+        body.push_str(
+            "<div class=\"empty\">No tokens yet — create one above to authenticate the CLI.</div>",
+        );
+    } else {
+        body.push_str("<div class=\"list\">");
+        for t in tokens {
+            body.push_str(&format!(
+                "<div class=\"list-row\"><div class=\"lr-main\"><div class=\"lr-name\">{name}</div></div>\
+                 <div class=\"lr-meta\">last used {used}<br>expires {exp}</div>\
+                 <form method=\"post\" action=\"/settings/tokens/revoke\">{csrf}\
+                 <input type=\"hidden\" name=\"name\" value=\"{namev}\">\
+                 <button type=\"submit\" class=\"btn-ghost btn-sm\">Revoke</button></form></div>",
+                name = esc(&t.name),
+                used = t.last_used.map(fmt_ts).unwrap_or_else(|| "never".into()),
+                exp = t.expires_at.map(fmt_ts).unwrap_or_else(|| "never".into()),
+                namev = esc(&t.name),
+                csrf = csrf_field,
+            ));
+        }
+        body.push_str("</div>");
     }
-    body.push_str("</table>");
     page("tokens", Some(&user), &body).into_response()
 }
 
@@ -770,9 +912,16 @@ async fn create_token(
         return error_page(&state, "could not create token");
     }
     let body = format!(
-        "<h1>Token created</h1><p>Copy this now — it will not be shown again:</p>\
-         <pre>{}</pre><p><a href=\"/settings/tokens\">back to tokens</a></p>",
-        esc(&token)
+        "{head}\
+         <div class=\"card narrow\">\
+         <p>Copy it now — for security, it <strong>won't be shown again</strong>.</p>\
+         <div class=\"reveal\"><code>{tok}</code>\
+         <button class=\"btn btn-ghost btn-sm\" \
+         onclick=\"navigator.clipboard.writeText('{tok}');this.textContent='Copied'\">Copy</button></div>\
+         <p style=\"margin-top:1rem\"><a class=\"link\" href=\"/settings/tokens\">← Back to tokens</a></p>\
+         </div>",
+        head = page_head("Token created", "", ""),
+        tok = esc(&token),
     );
     page("token", Some(&user), &body).into_response()
 }
@@ -807,27 +956,44 @@ async fn keys_page(State(state): State<AppState>, headers: HeaderMap) -> Respons
     let csrf = csrf_of(&state, &headers);
     let csrf_field = csrf_input(csrf.as_deref());
     let mut body = format!(
-        "<h1>SSH keys</h1><p class=\"muted\">Add your public key to clone, push, and \
-         pull over SSH (<code>chip clone ssh://chip@host/owner/repo</code>).</p>\
-         <div class=\"card narrow\"><form method=\"post\">{csrf_field}\
-         <p><label>Name</label><input name=\"name\" placeholder=\"laptop\" required></p>\
-         <p><label>Public key</label><input name=\"public_key\" placeholder=\"ssh-ed25519 AAAA… you@host\" required></p>\
-         <button type=\"submit\" class=\"btn-primary\">Add key</button></form></div>\
-         <table><tr><td><strong>name</strong></td><td><strong>fingerprint</strong></td><td></td></tr>",
+        "{head}{subnav}\
+         <div class=\"card\"><form method=\"post\">{csrf_field}\
+         <p><label>Name</label><input name=\"name\" placeholder=\"laptop\" autocomplete=\"off\" required></p>\
+         <p><label>Public key</label>\
+         <textarea name=\"public_key\" class=\"mono\" rows=\"4\" spellcheck=\"false\" \
+         placeholder=\"ssh-ed25519 AAAA… you@host\" required></textarea></p>\
+         <p class=\"hint\">Paste the contents of your public key file — e.g. \
+         <code>cat ~/.ssh/id_ed25519.pub</code>.</p>\
+         <button type=\"submit\" class=\"btn-primary\">Add key</button></form></div>",
+        head = page_head(
+            "SSH keys",
+            "Add your public key to clone, push, and pull over SSH.",
+            ""
+        ),
+        subnav = settings_subnav("keys"),
     );
-    for (name, fp) in keys {
-        body.push_str(&format!(
-            "<tr><td>{}</td><td class=\"muted\"><code>{}</code></td>\
-             <td><form method=\"post\" action=\"/settings/keys/revoke\">{}\
-             <input type=\"hidden\" name=\"fingerprint\" value=\"{}\">\
-             <button type=\"submit\" class=\"btn-ghost btn-sm\">revoke</button></form></td></tr>",
-            esc(&name),
-            esc(&fp),
-            csrf_field,
-            esc(&fp)
-        ));
+    body.push_str("<p class=\"list-head\">Your keys</p>");
+    if keys.is_empty() {
+        body.push_str(
+            "<div class=\"empty\">No SSH keys yet — add one above to use the SSH transport.</div>",
+        );
+    } else {
+        body.push_str("<div class=\"list\">");
+        for (name, fp) in keys {
+            body.push_str(&format!(
+                "<div class=\"list-row\"><div class=\"lr-main\">\
+                 <div class=\"lr-name\">{name}</div><div class=\"lr-sub\">{fp}</div></div>\
+                 <form method=\"post\" action=\"/settings/keys/revoke\">{csrf}\
+                 <input type=\"hidden\" name=\"fingerprint\" value=\"{fpv}\">\
+                 <button type=\"submit\" class=\"btn-ghost btn-sm\">Revoke</button></form></div>",
+                name = esc(&name),
+                fp = esc(&fp),
+                fpv = esc(&fp),
+                csrf = csrf_field,
+            ));
+        }
+        body.push_str("</div>");
     }
-    body.push_str("</table>");
     page("ssh keys", Some(&user), &body).into_response()
 }
 
@@ -1543,17 +1709,21 @@ async fn issue_web_token(db: &Db, user: &User) -> anyhow::Result<String> {
 }
 
 fn error_page(_state: &AppState, msg: &str) -> Response {
-    (
-        StatusCode::BAD_REQUEST,
-        page("error", None, &format!("<h1>Error</h1><p>{}</p>", esc(msg))),
-    )
-        .into_response()
+    let body = format!(
+        "<div class=\"center\"><div class=\"card narrow\" style=\"text-align:center\">\
+         <h1>Something went wrong</h1><p class=\"muted\">{}</p>\
+         <p style=\"margin-top:1rem\"><a class=\"btn btn-ghost\" href=\"/\">Back to repositories</a></p>\
+         </div></div>",
+        esc(msg)
+    );
+    (StatusCode::BAD_REQUEST, page("error", None, &body)).into_response()
 }
 
 fn not_found(_state: &AppState, user: Option<&User>) -> Response {
-    (
-        StatusCode::NOT_FOUND,
-        page("not found", user, "<h1>404</h1><p>Not found.</p>"),
-    )
-        .into_response()
+    let body = "<div class=\"center\"><div style=\"text-align:center\">\
+        <h1 style=\"font-size:3rem;margin:0\">404</h1>\
+        <p class=\"muted\">That page or repository doesn't exist, or you don't have access.</p>\
+        <p style=\"margin-top:1rem\"><a class=\"btn btn-primary\" href=\"/\">Back to repositories</a></p>\
+        </div></div>";
+    (StatusCode::NOT_FOUND, page("not found", user, body)).into_response()
 }

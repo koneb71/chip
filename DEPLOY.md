@@ -26,7 +26,7 @@ You can run without one:
 - **IP + HTTP, SSH for repos (simplest).** Skip TLS: in `.env` leave
   `CHIP_TLS_CERT`/`CHIP_TLS_KEY` blank, set `CHIP_BASE_URL=http://<ELASTIC_IP>:8080`,
   and in `docker-compose.prod.yml` change the server port mapping to
-  `"8080:8080"` and drop the `/certs` volume. The web UI is then plaintext
+  `"8080:8080"` and drop the `/etc/letsencrypt` volume. The web UI is then plaintext
   (fine for testing) — do real clone/push/pull over the encrypted **SSH
   transport** (`ssh://chip@<ELASTIC_IP>:2222/...`), which needs no domain or TLS.
 - **Free HTTPS via nip.io.** The hostname `<dashed-ip>.nip.io` resolves to your
@@ -69,6 +69,19 @@ sudo certbot certonly --standalone -d chip.example.com
 # Certs land in /etc/letsencrypt/live/chip.example.com/{fullchain,privkey}.pem
 ```
 
+> **certbot standalone needs inbound TCP 80** reachable from the internet. A
+> `Timeout during connect (likely firewall problem)` means your **EC2 Security
+> Group** is missing an HTTP/80 rule (a *timeout*, vs "connection refused", is the
+> tell-tale of a closed Security Group) — add `HTTP 80 from 0.0.0.0/0` and retry.
+>
+> **Cert-related crash loop?** If `docker compose logs server` repeats
+> `failed to read from file '…fullchain.pem': No such file or directory`, check:
+> (1) the cert actually exists — `sudo ls -lL /etc/letsencrypt/live/<domain>/`;
+> (2) `CHIP_TLS_CERT`/`CHIP_TLS_KEY` in `.env` use the **full**
+> `/etc/letsencrypt/live/<domain>/…` paths and the domain matches the directory
+> name. The compose file mounts all of `/etc/letsencrypt` so certbot's symlinks
+> resolve inside the container.
+
 ## 4. Configure secrets
 
 ```sh
@@ -77,7 +90,8 @@ cp .env.production.example .env
 echo "CHIP_SECRET=$(openssl rand -hex 32)"
 echo "CHIP_DATA_KEY=$(openssl rand -hex 32)"
 # Edit .env: paste those, set POSTGRES_PASSWORD, DATABASE_URL, CHIP_BASE_URL,
-# and CERT_DOMAIN=chip.example.com
+# and point CHIP_TLS_CERT/CHIP_TLS_KEY at your domain under
+# /etc/letsencrypt/live/<your-domain>/ (replace chip.example.com everywhere).
 nano .env
 ```
 

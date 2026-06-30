@@ -5,7 +5,10 @@
 #
 # The server terminates TLS itself (ALPN negotiates HTTP/2 for gRPC and
 # HTTP/1.1 for the web UI on one port), so no reverse proxy is needed.
-# Mount your certificate directory at /certs (read-only).
+#
+# The whole /etc/letsencrypt tree is mounted read-only (not just live/<domain>)
+# because certbot's live/ files are symlinks into ../../archive/<domain>; mounting
+# only live/ would leave those symlinks dangling inside the container.
 
 services:
   postgres:
@@ -47,7 +50,9 @@ services:
       - "2222:2222"    # SSH transport
     volumes:
       - repodata:/data
-      - /etc/letsencrypt/live/${CERT_DOMAIN:-chip.example.com}:/certs:ro
+      # Read-only Let's Encrypt tree; CHIP_TLS_CERT/KEY point at
+      # /etc/letsencrypt/live/<your-domain>/{fullchain,privkey}.pem.
+      - /etc/letsencrypt:/etc/letsencrypt:ro
 
 volumes:
   pgdata:
