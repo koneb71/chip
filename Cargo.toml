@@ -14,7 +14,7 @@ license = "MIT OR Apache-2.0"
 authors = ["chip contributors"]
 # Set this to your actual GitHub repo — cargo-dist builds installer download
 # URLs from it.
-repository = "https://github.com/your-org/chip"
+repository = "https://github.com/koneb71/chip"
 
 [workspace.dependencies]
 chip-core = { path = "crates/chip-core" }
