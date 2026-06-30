@@ -1,0 +1,70 @@
+# Local + Dokploy deployment for the chip server.
+#
+#   docker compose up --build            # postgres + server, objects on a volume
+#   docker compose --profile s3 up       # also start MinIO; set CHIP_OBJECT_STORE=s3://...
+#
+# For Dokploy: provision a Postgres database (or keep this `postgres` service),
+# set DATABASE_URL / CHIP_SECRET / CHIP_BASE_URL, and map a domain to the
+# `server` service's port 8080.
+
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: chip
+      POSTGRES_PASSWORD: chip
+      POSTGRES_DB: chip
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U chip"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
+  server:
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://chip:chip@postgres:5432/chip
+      CHIP_OBJECT_STORE: local:///data/repos
+      CHIP_SECRET: change-me-in-production
+      # Must match the published host port below so web UI links resolve.
+      CHIP_BASE_URL: http://localhost:${CHIP_PORT:-8442}
+      # Local dev: derive the data-encryption key from CHIP_SECRET so the stack
+      # boots without key management. PRODUCTION: remove CHIP_DEV, set a strong
+      # CHIP_SECRET, and provide CHIP_DATA_KEY (openssl rand -hex 32) — and back
+      # that key up, since losing it makes stored repositories unrecoverable.
+      CHIP_DEV: "1"
+      # Persist the SSH host key on the data volume.
+      CHIP_SSH_HOST_KEY: /data/ssh_host_ed25519
+    ports:
+      # Host port is unusual (and overridable) to avoid clashes with other
+      # services on 8080. The container always listens on 8080 internally.
+      - "${CHIP_PORT:-8442}:8080"
+      # SSH transport.
+      - "${CHIP_SSH_PORT:-2222}:2222"
+    volumes:
+      - repodata:/data
+
+  # Optional S3-compatible object storage for testing the s3:// backend.
+  # Enable with: docker compose --profile s3 up
+  minio:
+    image: minio/minio
+    profiles: ["s3"]
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: chip
+      MINIO_ROOT_PASSWORD: chipsecret
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - miniodata:/data
+
+volumes:
+  pgdata:
+  repodata:
+  miniodata:

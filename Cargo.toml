@@ -1,0 +1,106 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/chip-core",
+    "crates/chip-cli",
+    "crates/chip-proto",
+    "crates/chip-server",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+authors = ["chip contributors"]
+# Set this to your actual GitHub repo — cargo-dist builds installer download
+# URLs from it.
+repository = "https://github.com/your-org/chip"
+
+[workspace.dependencies]
+chip-core = { path = "crates/chip-core" }
+chip-proto = { path = "crates/chip-proto" }
+
+# Hashing / compression / serialization
+blake3 = "1"
+zstd = "0.13"
+serde = { version = "1", features = ["derive"] }
+bincode = "1"
+
+# VCS helpers
+diffy = "0.4"
+similar = "2"
+walkdir = "2"
+ignore = "0.4"
+rand = "0.8"
+time = { version = "0.3", features = ["formatting", "macros", "serde"] }
+
+# Errors / utils
+anyhow = "1"
+thiserror = "1"
+tempfile = "3"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Async / server / gRPC
+tokio = { version = "1", features = ["full"] }
+tonic = { version = "0.12", features = ["tls", "tls-roots"] }
+prost = "0.13"
+tonic-build = "0.12"
+axum = "0.7"
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace", "fs"] }
+hyper = "1"
+http = "1"
+futures = "0.3"
+
+# Server persistence / auth
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "uuid", "time", "macros"] }
+argon2 = "0.5"
+uuid = { version = "1", features = ["v4", "serde"] }
+askama = "0.12"
+tower-sessions = "0.13"
+object_store = { version = "0.11", features = ["aws"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+rand_core = { version = "0.6", features = ["std"] }
+
+# SSH transport — use the ring crypto backend (portable, no aws-lc C build) so
+# the CLI cross-compiles cleanly (incl. Windows).
+russh = { version = "0.61", default-features = false, features = ["ring", "flate2", "rsa"] }
+
+# --- cargo-dist: cross-platform release builds + installers for the `chip` CLI ---
+[workspace.metadata.dist]
+cargo-dist-version = "0.32.0"
+ci = "github"
+installers = ["shell", "powershell"]
+targets = [
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+    "x86_64-unknown-linux-musl",
+    "aarch64-unknown-linux-musl",
+    "x86_64-pc-windows-msvc",
+]
+install-updater = false
+
+# protoc is required to build chip-proto on the release runners.
+[workspace.metadata.dist.dependencies.apt]
+protobuf-compiler = '*'
+musl-tools = '*'
+
+[workspace.metadata.dist.dependencies.homebrew]
+protobuf = '*'
+
+[workspace.metadata.dist.dependencies.chocolatey]
+protoc = '*'
+
+# Optimized release builds: smaller, faster binaries.
+[profile.release]
+lto = "thin"
+strip = true
+codegen-units = 1
+
+# The release profile cargo-dist builds with.
+[profile.dist]
+inherits = "release"
+strip = true

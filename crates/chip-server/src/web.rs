@@ -1,0 +1,1479 @@
+//! Server-rendered web UI: account pages, repo browsing, change/diff views.
+//!
+//! HTML is rendered inline (small enough not to warrant a template engine) via
+//! the [`page`] wrapper.
+
+use std::str::FromStr;
+use std::sync::Arc;
+
+use axum::extract::{Form, Path, Request, State};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
+use axum::middleware::{self, Next};
+use axum::response::{Html, IntoResponse, Redirect, Response};
+use axum::routing::{get, post};
+use axum::Router;
+use chip_core::dag;
+use chip_core::diff;
+use chip_core::hash::ObjectId;
+use chip_core::object::EntryKind;
+use chip_core::store::ObjectStore;
+use serde::Deserialize;
+
+use crate::auth;
+use crate::config::Config;
+use crate::db::{Db, Role, User};
+use crate::store::StoreFactory;
+
+#[derive(Clone)]
+pub struct AppState {
+    pub db: Db,
+    pub stores: StoreFactory,
+    pub config: Arc<Config>,
+    pub limiter: Arc<crate::ratelimit::RateLimiter>,
+    pub tokens: Arc<crate::cache::TokenCache>,
+}
+
+pub fn router(state: AppState) -> Router {
+    Router::new()
+        .route("/", get(index))
+        .route("/docs", get(docs))
+        .route("/healthz", get(healthz))
+        .route("/readyz", get(readyz))
+        .route("/login", get(login_form).post(login_submit))
+        .route("/register", get(register_form).post(register_submit))
+        .route("/logout", post(logout))
+        .route("/new", get(new_repo_form).post(new_repo_submit))
+        .route("/settings/tokens", get(tokens_page).post(create_token))
+        .route("/settings/tokens/revoke", post(revoke_token))
+        .route("/settings/keys", get(keys_page).post(add_key))
+        .route("/settings/keys/revoke", post(revoke_key))
+        .route("/:owner/:repo", get(repo_overview))
+        .route("/:owner/:repo/collaborators", post(add_collaborator))
+        .route("/:owner/:repo/change/:id", get(change_view))
+        .route("/:owner/:repo/tree/:rev", get(tree_root))
+        .route("/:owner/:repo/tree/:rev/*path", get(tree_sub))
+        .route("/:owner/:repo/blob/:rev/*path", get(blob_view))
+        .layer(middleware::from_fn(security_headers))
+        .with_state(state)
+}
+
+/// Add hardening headers to every web response. The UI is fully self-contained
+/// (inline styles + one inline copy handler, no external resources), so a tight
+/// CSP applies.
+async fn security_headers(req: Request, next: Next) -> Response {
+    let mut res = next.run(req).await;
+    let h = res.headers_mut();
+    h.insert(
+        "x-content-type-options",
+        HeaderValue::from_static("nosniff"),
+    );
+    h.insert("x-frame-options", HeaderValue::from_static("DENY"));
+    h.insert("referrer-policy", HeaderValue::from_static("no-referrer"));
+    h.insert(
+        "content-security-policy",
+        HeaderValue::from_static(
+            "default-src 'none'; style-src 'unsafe-inline'; img-src data:; \
+             form-action 'self'; base-uri 'none'; frame-ancestors 'none'; \
+             script-src 'unsafe-inline'",
+        ),
+    );
+    res
+}
+
+// --- helpers ---------------------------------------------------------------
+
+/// The raw session token from the request cookies, if present.
+fn session_token(headers: &HeaderMap) -> Option<String> {
+    let cookie = headers.get(header::COOKIE)?.to_str().ok()?;
+    cookie
+        .split(';')
+        .filter_map(|c| c.trim().strip_prefix("chip_session="))
+        .next()
+        .map(|s| s.to_string())
+}
+
+async fn current_user(state: &AppState, headers: &HeaderMap) -> Option<User> {
+    let token = session_token(headers)?;
+    let hash = auth::hash_token(&token);
+    state.tokens.user_for_token(&hash).await.ok().flatten()
+}
+
+/// A CSRF token bound to both the session and the server secret. An attacker
+/// cannot forge it without the secret, nor derive it without the (HttpOnly)
+/// session cookie. Reuses chip-core's BLAKE3 hashing.
+fn csrf_for(secret: &str, session: &str) -> String {
+    chip_core::hash::ObjectId::hash(format!("{secret}::csrf::{session}").as_bytes()).to_hex()
+}
+
+/// The CSRF token for the current request's session, if logged in.
+fn csrf_of(state: &AppState, headers: &HeaderMap) -> Option<String> {
+    session_token(headers).map(|t| csrf_for(&state.config.secret, &t))
+}
+
+/// Verify a submitted CSRF token against the request's session. Returns false
+/// when no session, or the token is missing/incorrect.
+fn csrf_ok(state: &AppState, headers: &HeaderMap, submitted: &str) -> bool {
+    match csrf_of(state, headers) {
+        Some(expected) => {
+            // constant-time-ish comparison
+            expected.len() == submitted.len()
+                && expected
+                    .bytes()
+                    .zip(submitted.bytes())
+                    .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+                    == 0
+        }
+        None => false,
+    }
+}
+
+fn csrf_input(csrf: Option<&str>) -> String {
+    match csrf {
+        Some(c) => format!("<input type=\"hidden\" name=\"_csrf\" value=\"{c}\">"),
+        None => String::new(),
+    }
+}
+
+fn esc(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+fn page(title: &str, user: Option<&User>, body: &str) -> Html<String> {
+    let nav_user = match user {
+        Some(u) => format!(
+            "<a href=\"/settings/tokens\">Tokens</a>\
+             <a href=\"/settings/keys\">SSH keys</a>\
+             <span class=\"who\">{}</span>\
+             <form method=\"post\" action=\"/logout\" style=\"display:inline\">\
+             <button type=\"submit\" class=\"btn btn-ghost\">Log out</button></form>",
+            esc(&u.username)
+        ),
+        None => "<a href=\"/login\">Log in</a>\
+             <a class=\"btn btn-primary\" href=\"/register\">Sign up</a>"
+            .to_string(),
+    };
+    Html(format!(
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
+         <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
+         <title>{title} · chip</title>\
+         <style>{CSS}</style></head><body>\
+         <header class=\"nav\"><div class=\"nav-inner\">\
+         <a class=\"brand\" href=\"/\"><span class=\"logo\">◆</span> chip</a>\
+         <nav class=\"nav-links\"><a href=\"/docs\">Docs</a>{nav_user}</nav>\
+         </div></header>\
+         <main class=\"container fade-up\">{body}</main></body></html>"
+    ))
+}
+
+/// Minimal black & white stylesheet for the whole web UI.
+const CSS: &str = r#"
+:root{
+  --ink:#111111;--ink-soft:#3a3a3a;--muted:#6b6b6b;
+  --line:#e6e6e6;--bg:#ffffff;--surface:#ffffff;--soft:#f6f6f6;
+  --radius:14px;--shadow:0 4px 16px rgba(0,0,0,.06);--shadow-lg:0 10px 28px rgba(0,0,0,.12);
+}
+*{box-sizing:border-box}
+html{scroll-behavior:smooth}
+body{margin:0;color:var(--ink);background:var(--bg);
+  font-family:'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;
+  line-height:1.55;-webkit-font-smoothing:antialiased}
+h1{font-size:1.9rem;font-weight:700;letter-spacing:-.02em;margin:.2rem 0 1rem}
+h2{font-size:1.35rem;font-weight:700;letter-spacing:-.01em;margin:1.6rem 0 .6rem}
+h3{font-size:1.05rem;font-weight:600;margin:1.4rem 0 .5rem;color:var(--ink-soft)}
+p{margin:.5rem 0}
+a{color:var(--ink);text-decoration:none;transition:opacity .15s ease}
+a:hover{opacity:.6}
+code{background:var(--soft);padding:.1rem .35rem;border-radius:6px;font-size:.85em}
+.muted{color:var(--muted)}
+
+/* nav */
+.nav{position:sticky;top:0;z-index:20;background:rgba(255,255,255,.85);
+  backdrop-filter:saturate(180%) blur(12px);border-bottom:1px solid var(--line)}
+.nav-inner{max-width:960px;margin:0 auto;padding:.85rem 1.25rem;display:flex;
+  align-items:center;justify-content:space-between}
+.brand{display:flex;align-items:center;gap:.4rem;font-weight:800;font-size:1.3rem;
+  color:var(--ink);letter-spacing:-.02em}
+.brand .logo{transition:transform .4s cubic-bezier(.2,.7,.2,1)}
+.brand:hover .logo{transform:rotate(90deg) scale(1.1)}
+.nav-links{display:flex;align-items:center;gap:1.1rem}
+.nav-links a{color:var(--ink);font-weight:600;font-size:.95rem}
+.nav-links a:hover{opacity:.6}
+.nav-links a.btn-primary{color:#fff}
+.nav-links a.btn-primary:hover{opacity:1}
+.who{font-weight:600;color:var(--muted)}
+
+/* layout */
+.container{max-width:960px;margin:0 auto;padding:2rem 1.25rem 4rem}
+
+/* cards */
+.card{background:var(--surface);border:1px solid var(--line);border-radius:var(--radius);
+  padding:1.25rem 1.4rem;box-shadow:var(--shadow);
+  transition:transform .22s cubic-bezier(.2,.7,.2,1),box-shadow .22s ease,border-color .2s ease}
+.card:hover{transform:translateY(-4px);box-shadow:var(--shadow-lg);border-color:#d0d0d0}
+.cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(270px,1fr));gap:1.1rem;margin-top:1rem}
+.repo-card{display:block;color:inherit}
+.repo-card:hover{opacity:1}
+.repo-card .name{font-weight:700;font-size:1.1rem;color:var(--ink)}
+.repo-card .meta{color:var(--muted);font-size:.85rem;margin-top:.35rem}
+
+/* auth / narrow forms */
+.narrow{max-width:420px;margin:1.5rem auto}
+form p{margin:.6rem 0}
+label{font-weight:600;font-size:.9rem;display:block;margin-bottom:.2rem}
+input,select{width:100%;font-size:1rem;padding:.7rem .85rem;border:1px solid #d4d4d4;
+  border-radius:12px;background:#fff;color:var(--ink);transition:border-color .15s,box-shadow .15s}
+input:focus,select:focus{outline:none;border-color:var(--ink);
+  box-shadow:0 0 0 3px rgba(0,0,0,.12)}
+
+/* buttons */
+button,.btn{display:inline-flex;align-items:center;justify-content:center;gap:.4rem;
+  font-size:.95rem;font-weight:600;padding:.6rem 1.1rem;border-radius:999px;border:1px solid var(--ink);
+  cursor:pointer;background:var(--ink);color:#fff;
+  transition:transform .12s ease,box-shadow .2s ease,background .2s ease,color .2s ease}
+button:hover,.btn:hover{background:#000;box-shadow:0 6px 16px rgba(0,0,0,.18)}
+button:active,.btn:active{transform:scale(.96)}
+.btn-primary{background:var(--ink);color:#fff;border-color:var(--ink)}
+.btn-ghost{background:transparent;color:var(--ink);border-color:var(--line);box-shadow:none}
+.btn-ghost:hover{background:var(--soft);color:var(--ink);box-shadow:none}
+.btn-sm{padding:.35rem .8rem;font-size:.82rem}
+
+/* chips / badges */
+.chip{display:inline-flex;align-items:center;gap:.4rem;background:var(--soft);
+  border:1px solid var(--line);border-radius:999px;padding:.3rem .75rem;font-size:.85rem;
+  font-weight:600;margin:.2rem .35rem .2rem 0;color:var(--ink);
+  transition:transform .15s,border-color .15s}
+.chip:hover{transform:translateY(-1px);border-color:var(--ink)}
+.tag{color:var(--ink)}
+
+/* tables / lists */
+table{border-collapse:collapse;width:100%}
+td{padding:.55rem .6rem;border-bottom:1px solid var(--line)}
+tr{transition:background .15s ease}
+tbody tr:hover,table:not(.diff) tr:hover{background:var(--soft)}
+
+/* diff (monochrome) */
+.diffstat{margin:.4rem 0 1rem;font-size:.95rem}
+.add{color:var(--ink);font-weight:700}.del{color:var(--muted);font-weight:700}
+.filediff{border:1px solid var(--line);border-radius:14px;margin:1.1rem 0;overflow:hidden;
+  box-shadow:var(--shadow);transition:box-shadow .2s ease}
+.filediff:hover{box-shadow:var(--shadow-lg)}
+.fhead{background:var(--soft);padding:.65rem .9rem;font-family:ui-monospace,monospace;
+  font-size:.9rem;display:flex;gap:.6rem;align-items:center;border-bottom:1px solid var(--line)}
+.badge{display:inline-block;min-width:1.25rem;padding:0 .3rem;line-height:1.4rem;text-align:center;
+  border-radius:6px;color:#fff;font-weight:800;font-size:.72rem}
+.b-a{background:#111}.b-m{background:#777}.b-d{background:#cfcfcf;color:#333}
+table.diff{width:100%;border-collapse:collapse;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
+  font-size:.85rem;border:0}
+table.diff td{border:0;padding:.05rem .6rem;white-space:pre;vertical-align:top}
+table.diff tr:hover{background:transparent}
+td.ln{width:1%;text-align:right;color:#b0b0b0;background:#fbfbfb;user-select:none;border-right:1px solid var(--line)}
+tr.l-add{background:#efefef}tr.l-add td.code{color:#111}
+tr.l-del{background:#fafafa}tr.l-del td.code{color:#9a9a9a;text-decoration:line-through}
+tr.hunk td{background:#f3f3f3;color:#555;padding:.25rem .6rem;font-weight:600}
+
+pre{background:var(--soft);padding:1rem;overflow:auto;border-radius:12px;border:1px solid var(--line)}
+
+/* repo page */
+.repo-head{display:flex;align-items:center;gap:1rem;flex-wrap:wrap;margin-bottom:.4rem}
+.avatar{width:52px;height:52px;border-radius:14px;background:var(--ink);color:#fff;display:flex;
+  align-items:center;justify-content:center;font-weight:700;font-size:1.4rem;flex:0 0 auto;text-transform:uppercase}
+.metrics{display:flex;gap:2rem;margin:.5rem 0 1.5rem;flex-wrap:wrap}
+.metric b{font-size:1.3rem;font-weight:700;line-height:1.1;display:block}
+.metric span{font-size:.8rem;color:var(--muted)}
+.section{margin-top:1.9rem}
+.section-h{font-size:.78rem;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);
+  font-weight:700;margin:0 0 .6rem}
+.clone-box{display:flex;align-items:center;gap:.6rem;background:var(--soft);border:1px solid var(--line);
+  border-radius:12px;padding:.55rem .55rem .55rem .85rem;font-family:ui-monospace,Menlo,monospace;
+  font-size:.9rem;overflow:hidden}
+.clone-box code{background:none;padding:0;white-space:nowrap;overflow:auto;flex:1 1 auto}
+.copy-btn{margin-left:auto;flex:0 0 auto;padding:.35rem .8rem;font-size:.82rem}
+.commit-list{border:1px solid var(--line);border-radius:14px;overflow:hidden;box-shadow:var(--shadow)}
+.commit-row{display:flex;align-items:center;gap:1rem;padding:.8rem 1rem;text-decoration:none;
+  color:inherit;border-bottom:1px solid var(--line);transition:background .15s ease}
+.commit-row:last-child{border-bottom:0}
+.commit-row:hover{background:var(--soft);opacity:1}
+.hash{font-family:ui-monospace,Menlo,monospace;font-size:.78rem;background:#fff;border:1px solid var(--line);
+  border-radius:6px;padding:.15rem .45rem;color:var(--muted);flex:0 0 auto}
+.commit-main{flex:1 1 auto;min-width:0}
+.commit-msg{font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.commit-sub{font-size:.76rem;color:var(--muted);font-family:ui-monospace,Menlo,monospace}
+.commit-stat{flex:0 0 auto;font-size:.8rem;color:var(--muted);font-family:ui-monospace,Menlo,monospace}
+.empty{border:1px dashed #d8d8d8;border-radius:14px;padding:1.6rem;text-align:center;color:var(--muted)}
+
+/* file browser */
+.crumbs{margin:.5rem 0 1rem;font-family:ui-monospace,Menlo,monospace;font-size:.9rem}
+.crumbs a{color:var(--ink)}.crumbs span{color:var(--muted)}
+.filelist{border:1px solid var(--line);border-radius:14px;overflow:hidden;box-shadow:var(--shadow)}
+.filerow{display:block;padding:.6rem 1rem;text-decoration:none;color:inherit;border-bottom:1px solid var(--line);transition:background .15s ease}
+.filerow:last-child{border-bottom:0}
+.filerow:hover{background:var(--soft);opacity:1}
+table.blob{width:100%;border-collapse:collapse;font-family:ui-monospace,Menlo,monospace;font-size:.85rem;border:1px solid var(--line);border-radius:14px;overflow:hidden}
+table.blob td{border:0;padding:.05rem .6rem;white-space:pre;vertical-align:top}
+table.blob td.ln{width:1%;text-align:right;color:#b0b0b0;background:#fbfbfb;border-right:1px solid var(--line);user-select:none}
+table.blob tr:hover{background:var(--soft)}
+
+/* entrance animation */
+@keyframes fadeUp{from{opacity:0;transform:translateY(14px)}to{opacity:1;transform:none}}
+.fade-up{animation:fadeUp .5s cubic-bezier(.2,.7,.2,1) both}
+@media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+"#;
+
+fn session_cookie(token: &str, secure: bool) -> String {
+    let secure = if secure { "; Secure" } else { "" };
+    format!("chip_session={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=2592000{secure}")
+}
+
+// --- handlers --------------------------------------------------------------
+
+async fn healthz() -> impl IntoResponse {
+    (StatusCode::OK, "ok")
+}
+
+/// Readiness probe: checks the database is reachable. Used by load balancers /
+/// orchestrators to gate traffic.
+async fn readyz(State(state): State<AppState>) -> impl IntoResponse {
+    match state.db.ping().await {
+        Ok(()) => (StatusCode::OK, "ready"),
+        Err(_) => (StatusCode::SERVICE_UNAVAILABLE, "db unavailable"),
+    }
+}
+
+/// Public documentation page describing chip's model and CLI.
+async fn docs(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let user = current_user(&state, &headers).await;
+    let base = esc(state.config.base_url.trim_end_matches('/'));
+    let owner = user
+        .as_ref()
+        .map(|u| esc(&u.username))
+        .unwrap_or_else(|| "alice".to_string());
+
+    let body = format!(
+        r#"<h1>chip documentation</h1>
+<p class="muted">chip is a changeset-oriented version control system — a Git
+<em>alternative</em>, not a clone. This server hosts chip repositories and speaks
+the chip sync protocol over gRPC.</p>
+
+<h2>How chip differs from Git</h2>
+<ul>
+  <li><strong>No staging area.</strong> There is no <code>add</code>; the whole
+      working tree is snapshotted on <code>commit</code>.</li>
+  <li><strong>Stable change-ids.</strong> Every change has a change-id that
+      <em>persists across rewrites</em> (amend/rebase), separate from its content
+      (commit) hash.</li>
+  <li><strong>First-class conflicts.</strong> A conflicting merge never aborts —
+      it produces a conflicted change you resolve with a normal commit.</li>
+  <li><strong>Universal undo.</strong> <code>chip undo</code> reverses the last
+      operation via an operation log.</li>
+</ul>
+
+<h2>Getting started</h2>
+<ol>
+  <li><a href="/register">Create an account</a> (or <a href="/login">log in</a>).</li>
+  <li>Create an <a href="/settings/tokens">API token</a> for the CLI.</li>
+  <li>Authenticate the CLI, then clone a repository:</li>
+</ol>
+<pre>chip login {base} -u {owner}
+chip clone {base}/{owner}/&lt;repo&gt;</pre>
+<p>Create a repository from the <a href="/new">New repository</a> page, then push
+to it.</p>
+
+<h2>Everyday workflow</h2>
+<p>There is no staging step — edit files, then commit the whole tree.</p>
+<pre>chip init                     # start a repository
+chip commit -m "message"      # snapshot the working tree as a new change
+chip status                   # what changed since the last commit
+chip diff                     # unified diff of those changes
+chip log                      # history, organized by change-id
+chip show [rev]               # a change's metadata + diff (default: @)
+chip undo                     # reverse the last operation</pre>
+
+<h2>Branching &amp; history</h2>
+<pre>chip bookmark &lt;name&gt;          # create/move a bookmark (named branch)
+chip checkout &lt;name|commit&gt;   # switch and update the working tree
+chip checkout -b &lt;name&gt;       # create a bookmark at HEAD and switch
+chip merge &lt;name|commit&gt;      # three-way merge (conflicts stay first-class)
+chip rebase &lt;name|commit&gt;     # replay the branch onto a new base (keeps change-ids)
+chip cherry-pick &lt;rev&gt;        # copy one commit's change onto the current change
+chip amend [-m msg]           # rewrite the current change, keeping its change-id
+chip resolve                  # clear resolved conflict markers</pre>
+<p class="muted">A <code>rev</code> may be a bookmark, tag, <code>@</code>, or a
+commit id — abbreviated ids (the 12-char prefix in <code>chip log</code>) work too.</p>
+
+<h2>Working with this server</h2>
+<pre>chip remote add origin {base}/{owner}/&lt;repo&gt;
+chip push origin [--force]    # --force allows a non-fast-forward update
+chip pull origin              # fast-forward; warns (never clobbers) on divergence
+chip pull origin --rebase     # on divergence, rebase local changes onto the remote
+chip pull origin --merge      # on divergence, create a merge commit</pre>
+
+<h2>Access &amp; security</h2>
+<p>Repositories are public or private, with read/write collaborators managed by
+the owner on the repository page. Repository <strong>object data is encrypted at
+rest</strong> (AES-256-GCM). Passwords are Argon2-hashed; CLI tokens are stored
+only as hashes (revocable, optionally expiring); failed logins are rate-limited;
+and pushes are fast-forward unless forced.</p>
+"#
+    );
+
+    page("docs", user.as_ref(), &body).into_response()
+}
+
+async fn index(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let user = current_user(&state, &headers).await;
+    let repos = state
+        .db
+        .list_visible_repos(user.as_ref().map(|u| u.id))
+        .await
+        .unwrap_or_default();
+    let mut body = String::from(
+        "<div style=\"display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:1rem\">\
+         <h1 style=\"margin:0\">Repositories</h1>",
+    );
+    if user.is_some() {
+        body.push_str("<a class=\"btn btn-primary\" href=\"/new\">+ New repository</a>");
+    }
+    body.push_str("</div>");
+
+    if repos.is_empty() {
+        body.push_str(
+            "<div class=\"card\" style=\"text-align:center;margin-top:1.5rem\">\
+             <p style=\"font-size:1.1rem;font-weight:600\">No repositories yet</p>\
+             <p class=\"muted\">Create one to start pushing changes.</p></div>",
+        );
+    } else {
+        body.push_str("<div class=\"cards\">");
+        for r in repos {
+            let vis_chip = if r.visibility == "public" {
+                "<span class=\"chip\">Public</span>"
+            } else {
+                "<span class=\"chip\">Private</span>"
+            };
+            body.push_str(&format!(
+                "<a class=\"card repo-card\" href=\"/{0}/{1}\">\
+                 <div class=\"name\">{0}/{1}</div>\
+                 <div class=\"meta\">{2}</div></a>",
+                esc(&r.owner),
+                esc(&r.name),
+                vis_chip
+            ));
+        }
+        body.push_str("</div>");
+    }
+    page("chip", user.as_ref(), &body).into_response()
+}
+
+async fn login_form(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let user = current_user(&state, &headers).await;
+    let body = "<div class=\"card narrow\"><h1>Welcome back</h1>\
+        <p class=\"muted\">Log in to your chip account.</p><form method=\"post\">\
+        <p><label>Username</label><input name=\"username\" placeholder=\"username\" required></p>\
+        <p><label>Password</label><input name=\"password\" type=\"password\" placeholder=\"password\" required></p>\
+        <button type=\"submit\" class=\"btn-primary\" style=\"width:100%;margin-top:.5rem\">Log in</button></form>\
+        <p class=\"muted\" style=\"margin-top:1rem;text-align:center\">New here? <a href=\"/register\">Create an account</a></p></div>";
+    page("login", user.as_ref(), body).into_response()
+}
+
+#[derive(Deserialize)]
+struct Credentials {
+    username: String,
+    password: String,
+}
+
+async fn login_submit(State(state): State<AppState>, Form(form): Form<Credentials>) -> Response {
+    if !state.limiter.allowed(&form.username).await {
+        return error_page(&state, "too many failed login attempts; try again later");
+    }
+    let user = state
+        .db
+        .find_user_by_username(&form.username)
+        .await
+        .ok()
+        .flatten()
+        .filter(|u| auth::verify_password(&form.password, &u.password_hash));
+    match user {
+        Some(u) => {
+            state.limiter.record_success(&form.username).await;
+            match issue_web_token(&state.db, &u).await {
+                Ok(token) => {
+                    let mut headers = HeaderMap::new();
+                    headers.insert(
+                        header::SET_COOKIE,
+                        session_cookie(&token, state.config.cookie_secure)
+                            .parse()
+                            .unwrap(),
+                    );
+                    (headers, Redirect::to("/")).into_response()
+                }
+                Err(_) => error_page(&state, "could not start session"),
+            }
+        }
+        None => {
+            state.limiter.record_failure(&form.username).await;
+            error_page(&state, "invalid credentials")
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct Registration {
+    username: String,
+    email: String,
+    password: String,
+}
+
+async fn register_form(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let user = current_user(&state, &headers).await;
+    let body = "<div class=\"card narrow\"><h1>Create your account</h1>\
+        <p class=\"muted\">Host and sync repositories with chip.</p><form method=\"post\">\
+        <p><label>Username</label><input name=\"username\" placeholder=\"letters, digits, - or _\" required></p>\
+        <p><label>Email</label><input name=\"email\" type=\"email\" placeholder=\"you@example.com\" required></p>\
+        <p><label>Password</label><input name=\"password\" type=\"password\" placeholder=\"at least 8 characters\" required></p>\
+        <button type=\"submit\" class=\"btn-primary\" style=\"width:100%;margin-top:.5rem\">Create account</button></form>\
+        <p class=\"muted\" style=\"margin-top:1rem;text-align:center\">Already have an account? <a href=\"/login\">Log in</a></p></div>";
+    page("register", user.as_ref(), body).into_response()
+}
+
+async fn register_submit(
+    State(state): State<AppState>,
+    Form(form): Form<Registration>,
+) -> Response {
+    if !crate::validate::valid_name(&form.username) {
+        return error_page(
+            &state,
+            "username must be 1-64 chars of letters, digits, '-' or '_'",
+        );
+    }
+    if form.password.len() < auth::MIN_PASSWORD_LEN {
+        return error_page(&state, "password must be at least 8 characters");
+    }
+    if state
+        .db
+        .find_user_by_username(&form.username)
+        .await
+        .ok()
+        .flatten()
+        .is_some()
+    {
+        return error_page(&state, "username taken");
+    }
+    let hash = match auth::hash_password(&form.password) {
+        Ok(h) => h,
+        Err(_) => return error_page(&state, "internal error"),
+    };
+    let user = match state
+        .db
+        .create_user(&form.username, &form.email, &hash)
+        .await
+    {
+        Ok(u) => u,
+        Err(_) => return error_page(&state, "could not create account"),
+    };
+    match issue_web_token(&state.db, &user).await {
+        Ok(token) => {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                header::SET_COOKIE,
+                session_cookie(&token, state.config.cookie_secure)
+                    .parse()
+                    .unwrap(),
+            );
+            (headers, Redirect::to("/")).into_response()
+        }
+        Err(_) => error_page(&state, "could not start session"),
+    }
+}
+
+async fn logout() -> Response {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::SET_COOKIE,
+        "chip_session=; Path=/; Max-Age=0".parse().unwrap(),
+    );
+    (headers, Redirect::to("/")).into_response()
+}
+
+#[derive(Deserialize)]
+struct NewRepo {
+    name: String,
+    visibility: String,
+    #[serde(default)]
+    _csrf: String,
+}
+
+async fn new_repo_form(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let Some(user) = current_user(&state, &headers).await else {
+        return Redirect::to("/login").into_response();
+    };
+    let body = format!(
+        "<div class=\"card narrow\"><h1>New repository</h1>\
+        <p class=\"muted\">Give it a name and choose who can see it.</p><form method=\"post\">{}\
+        <p><label>Repository name</label><input name=\"name\" placeholder=\"letters, digits, - or _\" required></p>\
+        <p><label>Visibility</label><select name=\"visibility\">\
+        <option value=\"private\">Private — only you and collaborators</option>\
+        <option value=\"public\">Public — anyone can view</option></select></p>\
+        <button type=\"submit\" class=\"btn-primary\" style=\"width:100%;margin-top:.5rem\">Create repository</button></form></div>",
+        csrf_input(csrf_of(&state, &headers).as_deref())
+    );
+    page("new repo", Some(&user), &body).into_response()
+}
+
+async fn new_repo_submit(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<NewRepo>,
+) -> Response {
+    let Some(user) = current_user(&state, &headers).await else {
+        return Redirect::to("/login").into_response();
+    };
+    if !csrf_ok(&state, &headers, &form._csrf) {
+        return error_page(&state, "invalid CSRF token");
+    }
+    if !crate::validate::valid_name(&form.name) {
+        return error_page(
+            &state,
+            "repository name must be 1-64 chars of letters, digits, '-' or '_'",
+        );
+    }
+    let visibility = if form.visibility == "public" {
+        "public"
+    } else {
+        "private"
+    };
+    match state.db.create_repo(user.id, &form.name, visibility).await {
+        Ok(_) => Redirect::to(&format!("/{}/{}", user.username, form.name)).into_response(),
+        Err(_) => error_page(&state, "could not create repository (name taken?)"),
+    }
+}
+
+async fn tokens_page(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let Some(user) = current_user(&state, &headers).await else {
+        return Redirect::to("/login").into_response();
+    };
+    let tokens = state.db.list_tokens(user.id).await.unwrap_or_default();
+    let csrf = csrf_of(&state, &headers);
+    let csrf_field = csrf_input(csrf.as_deref());
+    let mut body = format!(
+        "<h1>API tokens</h1><p class=\"muted\">Tokens authenticate the <code>chip</code> CLI.</p>\
+         <form method=\"post\">{csrf_field}<input name=\"name\" placeholder=\"token name\" required> \
+         <input name=\"expires_days\" type=\"number\" min=\"1\" placeholder=\"expires in N days (optional)\" style=\"width:16rem\"> \
+         <button type=\"submit\">Create token</button></form>\
+         <table><tr><td><strong>name</strong></td><td><strong>last used</strong></td>\
+         <td><strong>expires</strong></td><td></td></tr>",
+    );
+    for t in tokens {
+        body.push_str(&format!(
+            "<tr><td>{}</td><td class=\"muted\">{}</td><td class=\"muted\">{}</td>\
+             <td><form method=\"post\" action=\"/settings/tokens/revoke\">{}\
+             <input type=\"hidden\" name=\"name\" value=\"{}\">\
+             <button type=\"submit\">revoke</button></form></td></tr>",
+            esc(&t.name),
+            t.last_used.map(fmt_ts).unwrap_or_else(|| "never".into()),
+            t.expires_at.map(fmt_ts).unwrap_or_else(|| "never".into()),
+            csrf_field,
+            esc(&t.name)
+        ));
+    }
+    body.push_str("</table>");
+    page("tokens", Some(&user), &body).into_response()
+}
+
+fn fmt_ts(t: time::OffsetDateTime) -> String {
+    format!("{:04}-{:02}-{:02}", t.year(), t.month() as u8, t.day())
+}
+
+#[derive(Deserialize)]
+struct TokenForm {
+    name: String,
+    #[serde(default)]
+    expires_days: Option<i64>,
+    #[serde(default)]
+    _csrf: String,
+}
+
+async fn create_token(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<TokenForm>,
+) -> Response {
+    let Some(user) = current_user(&state, &headers).await else {
+        return Redirect::to("/login").into_response();
+    };
+    if !csrf_ok(&state, &headers, &form._csrf) {
+        return error_page(&state, "invalid CSRF token");
+    }
+    let expires_at = form
+        .expires_days
+        .filter(|d| *d > 0)
+        .map(|d| time::OffsetDateTime::now_utc() + time::Duration::days(d));
+    let token = auth::generate_token();
+    let hash = auth::hash_token(&token);
+    if state
+        .db
+        .create_token(user.id, &form.name, &hash, expires_at)
+        .await
+        .is_err()
+    {
+        return error_page(&state, "could not create token");
+    }
+    let body = format!(
+        "<h1>Token created</h1><p>Copy this now — it will not be shown again:</p>\
+         <pre>{}</pre><p><a href=\"/settings/tokens\">back to tokens</a></p>",
+        esc(&token)
+    );
+    page("token", Some(&user), &body).into_response()
+}
+
+async fn revoke_token(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<TokenForm>,
+) -> Response {
+    if let Some(user) = current_user(&state, &headers).await {
+        if csrf_ok(&state, &headers, &form._csrf) {
+            let _ = state.db.revoke_token(user.id, &form.name).await;
+        }
+    }
+    Redirect::to("/settings/tokens").into_response()
+}
+
+// --- SSH keys ---------------------------------------------------------------
+
+/// Compute the SHA256 fingerprint of an openssh public-key line.
+fn ssh_fingerprint(line: &str) -> Option<String> {
+    use russh::keys::ssh_key::{HashAlg, PublicKey};
+    let key = PublicKey::from_openssh(line.trim()).ok()?;
+    Some(key.fingerprint(HashAlg::Sha256).to_string())
+}
+
+async fn keys_page(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let Some(user) = current_user(&state, &headers).await else {
+        return Redirect::to("/login").into_response();
+    };
+    let keys = state.db.list_ssh_keys(user.id).await.unwrap_or_default();
+    let csrf = csrf_of(&state, &headers);
+    let csrf_field = csrf_input(csrf.as_deref());
+    let mut body = format!(
+        "<h1>SSH keys</h1><p class=\"muted\">Add your public key to clone, push, and \
+         pull over SSH (<code>chip clone ssh://chip@host/owner/repo</code>).</p>\
+         <div class=\"card narrow\"><form method=\"post\">{csrf_field}\
+         <p><label>Name</label><input name=\"name\" placeholder=\"laptop\" required></p>\
+         <p><label>Public key</label><input name=\"public_key\" placeholder=\"ssh-ed25519 AAAA… you@host\" required></p>\
+         <button type=\"submit\" class=\"btn-primary\">Add key</button></form></div>\
+         <table><tr><td><strong>name</strong></td><td><strong>fingerprint</strong></td><td></td></tr>",
+    );
+    for (name, fp) in keys {
+        body.push_str(&format!(
+            "<tr><td>{}</td><td class=\"muted\"><code>{}</code></td>\
+             <td><form method=\"post\" action=\"/settings/keys/revoke\">{}\
+             <input type=\"hidden\" name=\"fingerprint\" value=\"{}\">\
+             <button type=\"submit\" class=\"btn-ghost btn-sm\">revoke</button></form></td></tr>",
+            esc(&name),
+            esc(&fp),
+            csrf_field,
+            esc(&fp)
+        ));
+    }
+    body.push_str("</table>");
+    page("ssh keys", Some(&user), &body).into_response()
+}
+
+#[derive(Deserialize)]
+struct KeyForm {
+    name: String,
+    public_key: String,
+    #[serde(default)]
+    _csrf: String,
+}
+
+async fn add_key(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<KeyForm>,
+) -> Response {
+    let Some(user) = current_user(&state, &headers).await else {
+        return Redirect::to("/login").into_response();
+    };
+    if !csrf_ok(&state, &headers, &form._csrf) {
+        return error_page(&state, "invalid CSRF token");
+    }
+    let Some(fingerprint) = ssh_fingerprint(&form.public_key) else {
+        return error_page(&state, "could not parse that public key");
+    };
+    match state
+        .db
+        .add_ssh_key(user.id, &form.name, &fingerprint, form.public_key.trim())
+        .await
+    {
+        Ok(()) => Redirect::to("/settings/keys").into_response(),
+        Err(_) => error_page(&state, "could not add key (already registered?)"),
+    }
+}
+
+#[derive(Deserialize)]
+struct RevokeKeyForm {
+    fingerprint: String,
+    #[serde(default)]
+    _csrf: String,
+}
+
+async fn revoke_key(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<RevokeKeyForm>,
+) -> Response {
+    if let Some(user) = current_user(&state, &headers).await {
+        if csrf_ok(&state, &headers, &form._csrf) {
+            let _ = state.db.delete_ssh_key(user.id, &form.fingerprint).await;
+        }
+    }
+    Redirect::to("/settings/keys").into_response()
+}
+
+async fn repo_overview(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((owner, name)): Path<(String, String)>,
+) -> Response {
+    let user = current_user(&state, &headers).await;
+    let Some(repo) = state.db.find_repo(&owner, &name).await.ok().flatten() else {
+        return not_found(&state, user.as_ref());
+    };
+    if state
+        .db
+        .role_for(&repo, user.as_ref().map(|u| u.id))
+        .await
+        .ok()
+        .flatten()
+        .is_none()
+    {
+        return not_found(&state, user.as_ref());
+    }
+
+    let bookmarks = state.db.list_refs(repo.id, false).await.unwrap_or_default();
+    let tags = state.db.list_refs(repo.id, true).await.unwrap_or_default();
+
+    let is_owner = user.as_ref().map(|u| u.id) == Some(repo.owner_id);
+
+    // Load history up front so the metrics can show a change count.
+    let store = state.stores.repo_store(&owner, &name).ok();
+    let history = match (store.as_ref(), bookmarks.first()) {
+        (Some(s), Some((_, head))) => ObjectId::from_str(head)
+            .ok()
+            .and_then(|h| dag::history(s, h).ok())
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    };
+
+    let vis_chip = if repo.visibility == "public" {
+        "<span class=\"chip\">Public</span>"
+    } else {
+        "<span class=\"chip\">Private</span>"
+    };
+    let initial = owner.chars().next().unwrap_or('?').to_string();
+
+    // Header: avatar + name + visibility, then metrics.
+    let mut body = format!(
+        "<div class=\"repo-head\"><div class=\"avatar\">{}</div>\
+         <div><div style=\"display:flex;align-items:center;gap:.6rem;flex-wrap:wrap\">\
+         <h1 style=\"margin:0\">{}/{}</h1>{}</div>\
+         <div class=\"muted\" style=\"font-size:.9rem\">Owned by {}</div></div></div>\
+         <div class=\"metrics\">\
+         <div class=\"metric\"><b>{}</b><span>bookmarks</span></div>\
+         <div class=\"metric\"><b>{}</b><span>tags</span></div>\
+         <div class=\"metric\"><b>{}</b><span>changes</span></div></div>",
+        esc(&initial),
+        esc(&owner),
+        esc(&name),
+        vis_chip,
+        esc(&owner),
+        bookmarks.len(),
+        tags.len(),
+        history.len(),
+    );
+
+    // Browse files at the default bookmark.
+    if let Some((bn, _)) = bookmarks.first() {
+        body.push_str(&format!(
+            "<a class=\"btn btn-primary\" href=\"/{}/{}/tree/{}\">Browse files</a>",
+            esc(&owner),
+            esc(&name),
+            esc(bn)
+        ));
+    }
+
+    // Clone box with a copy button.
+    let clone_cmd = format!(
+        "chip clone {}/{}/{}",
+        state.config.base_url.trim_end_matches('/'),
+        owner,
+        name
+    );
+    body.push_str(&format!(
+        "<div class=\"section\"><div class=\"section-h\">Clone</div>\
+         <div class=\"clone-box\"><code>{}</code>\
+         <button class=\"btn btn-ghost copy-btn\" \
+         onclick=\"navigator.clipboard.writeText('{}');this.textContent='Copied'\">Copy</button></div></div>",
+        esc(&clone_cmd),
+        esc(&clone_cmd),
+    ));
+
+    // Bookmarks & tags.
+    body.push_str("<div class=\"section\"><div class=\"section-h\">Bookmarks</div>");
+    if bookmarks.is_empty() {
+        body.push_str("<p class=\"muted\">No bookmarks pushed yet.</p>");
+    } else {
+        for (bn, target) in &bookmarks {
+            body.push_str(&format!(
+                "<a class=\"chip\" href=\"/{}/{}/change/{}\">{} <span class=\"muted\">{}</span></a>",
+                esc(&owner),
+                esc(&name),
+                esc(target),
+                esc(bn),
+                &target[..target.len().min(8)]
+            ));
+        }
+    }
+    body.push_str("</div>");
+    if !tags.is_empty() {
+        body.push_str("<div class=\"section\"><div class=\"section-h\">Tags</div>");
+        for (tn, target) in &tags {
+            body.push_str(&format!(
+                "<a class=\"chip\" href=\"/{}/{}/change/{}\"><span class=\"tag\">{}</span> <span class=\"muted\">{}</span></a>",
+                esc(&owner),
+                esc(&name),
+                esc(target),
+                esc(tn),
+                &target[..target.len().min(8)]
+            ));
+        }
+        body.push_str("</div>");
+    }
+
+    // Recent changes as a styled list.
+    body.push_str("<div class=\"section\"><div class=\"section-h\">Recent changes</div>");
+    if history.is_empty() {
+        body.push_str("<div class=\"empty\">No changes yet — push a commit to get started.</div>");
+    } else if let Some(store) = store.as_ref() {
+        body.push_str("<div class=\"commit-list\">");
+        for (id, commit) in history.iter().take(20) {
+            let commit_hex = id.to_hex();
+            // Read-through cache: per-commit stats are immutable (commit id is a
+            // content hash), so compute once and reuse forever (shared via DB).
+            let (files, added, removed) = match state.db.get_commit_stat(repo.id, &commit_hex).await
+            {
+                Ok(Some(s)) => s,
+                _ => {
+                    let base_tree = commit
+                        .parents
+                        .first()
+                        .and_then(|p| store.get_commit(p).ok())
+                        .map(|c| c.tree);
+                    let s = diff::diff_stat(store, base_tree.as_ref(), &commit.tree)
+                        .unwrap_or_default();
+                    let triple = (s.files as i32, s.added as i32, s.removed as i32);
+                    let _ = state
+                        .db
+                        .put_commit_stat(repo.id, &commit_hex, triple.0, triple.1, triple.2)
+                        .await;
+                    triple
+                }
+            };
+            body.push_str(&format!(
+                "<a class=\"commit-row\" href=\"/{}/{}/change/{}\">\
+                 <span class=\"hash\">{}</span>\
+                 <div class=\"commit-main\"><div class=\"commit-msg\">{}</div>\
+                 <div class=\"commit-sub\">change {}</div></div>\
+                 <div class=\"commit-stat\">{} files <span class=\"add\">+{}</span> <span class=\"del\">-{}</span></div></a>",
+                esc(&owner),
+                esc(&name),
+                commit_hex,
+                id.short(),
+                esc(commit.message.lines().next().unwrap_or("")),
+                esc(&commit.change_id.to_string()),
+                files,
+                added,
+                removed,
+            ));
+        }
+        body.push_str("</div>");
+    }
+    body.push_str("</div>");
+
+    // Owner-only collaborator management, in a card at the bottom.
+    if is_owner {
+        body.push_str(&format!(
+            "<div class=\"section\"><div class=\"section-h\">Collaborators</div>\
+             <div class=\"card\"><form method=\"post\" action=\"collaborators\" \
+             style=\"display:flex;gap:.6rem;flex-wrap:wrap;align-items:center;margin:0\">{}\
+             <input name=\"username\" placeholder=\"username\" required style=\"flex:1 1 12rem;width:auto\">\
+             <select name=\"role\" style=\"width:auto\"><option value=\"read\">Read</option>\
+             <option value=\"write\">Write</option></select>\
+             <button type=\"submit\">Add</button></form></div></div>",
+            csrf_input(csrf_of(&state, &headers).as_deref())
+        ));
+    }
+
+    page(&format!("{owner}/{name}"), user.as_ref(), &body).into_response()
+}
+
+#[derive(Deserialize)]
+struct CollaboratorForm {
+    username: String,
+    role: String,
+    #[serde(default)]
+    _csrf: String,
+}
+
+async fn add_collaborator(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((owner, name)): Path<(String, String)>,
+    Form(form): Form<CollaboratorForm>,
+) -> Response {
+    let user = current_user(&state, &headers).await;
+    let Some(repo) = state.db.find_repo(&owner, &name).await.ok().flatten() else {
+        return not_found(&state, user.as_ref());
+    };
+    // Only the owner may manage collaborators.
+    if user.as_ref().map(|u| u.id) != Some(repo.owner_id) {
+        return error_page(&state, "only the owner can add collaborators");
+    }
+    if !csrf_ok(&state, &headers, &form._csrf) {
+        return error_page(&state, "invalid CSRF token");
+    }
+    let Some(target) = state
+        .db
+        .find_user_by_username(&form.username)
+        .await
+        .ok()
+        .flatten()
+    else {
+        return error_page(&state, "no such user");
+    };
+    let role = if form.role == "write" {
+        Role::Write
+    } else {
+        Role::Read
+    };
+    if state
+        .db
+        .add_collaborator(repo.id, target.id, role)
+        .await
+        .is_err()
+    {
+        return error_page(&state, "could not add collaborator");
+    }
+    Redirect::to(&format!("/{owner}/{name}")).into_response()
+}
+
+/// Render structured file diffs as an HTML diff view (summary + per-file tables).
+fn render_diff_html(diffs: &[chip_core::diff::FileDiff]) -> String {
+    use chip_core::diff::{FileStatus, LineKind};
+    if diffs.is_empty() {
+        return "<p class=\"muted\">No changes.</p>".to_string();
+    }
+    let total_add: usize = diffs.iter().map(|d| d.added).sum();
+    let total_del: usize = diffs.iter().map(|d| d.removed).sum();
+    let mut out = format!(
+        "<p class=\"diffstat\"><strong>{} file(s) changed</strong> \
+         <span class=\"add\">+{total_add}</span> <span class=\"del\">-{total_del}</span></p>",
+        diffs.len()
+    );
+    for d in diffs {
+        let (badge_class, letter) = match d.status {
+            FileStatus::Added => ("b-a", 'A'),
+            FileStatus::Modified => ("b-m", 'M'),
+            FileStatus::Deleted => ("b-d", 'D'),
+        };
+        out.push_str(&format!(
+            "<div class=\"filediff\"><div class=\"fhead\">\
+             <span class=\"badge {badge_class}\">{letter}</span> <strong>{}</strong>",
+            esc(&d.path)
+        ));
+        if !d.binary {
+            out.push_str(&format!(
+                " <span class=\"add\">+{}</span> <span class=\"del\">-{}</span>",
+                d.added, d.removed
+            ));
+        }
+        out.push_str("</div>");
+        if d.binary {
+            out.push_str(
+                "<p class=\"muted\" style=\"padding:.5rem .75rem\">Binary file changed</p></div>",
+            );
+            continue;
+        }
+        out.push_str("<table class=\"diff\">");
+        for hunk in &d.hunks {
+            out.push_str(&format!(
+                "<tr class=\"hunk\"><td colspan=\"3\">{}</td></tr>",
+                esc(&hunk.header)
+            ));
+            for line in &hunk.lines {
+                let (row_class, sign) = match line.kind {
+                    LineKind::Insert => ("l-add", '+'),
+                    LineKind::Delete => ("l-del", '-'),
+                    LineKind::Context => ("l-ctx", ' '),
+                };
+                let old = line.old_no.map(|n| n.to_string()).unwrap_or_default();
+                let new = line.new_no.map(|n| n.to_string()).unwrap_or_default();
+                out.push_str(&format!(
+                    "<tr class=\"{row_class}\"><td class=\"ln\">{old}</td><td class=\"ln\">{new}</td>\
+                     <td class=\"code\">{sign}{}</td></tr>",
+                    esc(&line.content)
+                ));
+            }
+        }
+        out.push_str("</table></div>");
+    }
+    out
+}
+
+async fn change_view(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((owner, name, id)): Path<(String, String, String)>,
+) -> Response {
+    let user = current_user(&state, &headers).await;
+    let Some(repo) = state.db.find_repo(&owner, &name).await.ok().flatten() else {
+        return not_found(&state, user.as_ref());
+    };
+    if state
+        .db
+        .role_for(&repo, user.as_ref().map(|u| u.id))
+        .await
+        .ok()
+        .flatten()
+        .is_none()
+    {
+        return not_found(&state, user.as_ref());
+    }
+    let store = match state.stores.repo_store(&owner, &name) {
+        Ok(s) => s,
+        Err(_) => return error_page(&state, "store error"),
+    };
+    let commit_id = match ObjectId::from_str(&id) {
+        Ok(i) => i,
+        Err(_) => return not_found(&state, user.as_ref()),
+    };
+    let commit = match store.get_commit(&commit_id) {
+        Ok(c) => c,
+        Err(_) => return not_found(&state, user.as_ref()),
+    };
+
+    // Diff against first parent (or empty tree for a root commit).
+    let base_tree = commit
+        .parents
+        .first()
+        .and_then(|p| store.get_commit(p).ok())
+        .map(|c| c.tree);
+    let diff_html = match diff::file_diffs(&store, base_tree.as_ref(), &commit.tree) {
+        Ok(diffs) => render_diff_html(&diffs),
+        Err(e) => {
+            tracing::warn!(
+                "diff render failed for {owner}/{name}@{}: {e}",
+                commit_id.short()
+            );
+            "<p class=\"muted\">(diff unavailable)</p>".to_string()
+        }
+    };
+
+    let conflict_note = if commit.is_conflicted() {
+        format!(
+            "<p style=\"color:#b91c1c\">⚠ conflicted files: {}</p>",
+            esc(&commit.conflicts.join(", "))
+        )
+    } else {
+        String::new()
+    };
+
+    let body = format!(
+        "<h1>change {}</h1><p>commit <code>{}</code> · \
+         <a href=\"/{}/{}/tree/{}\">browse files at this change</a></p>\
+         <p>{} · {}</p><p><strong>{}</strong></p>{}{}",
+        esc(&commit.change_id.to_string()),
+        commit_id.short(),
+        esc(&owner),
+        esc(&name),
+        commit_id.to_hex(),
+        esc(&commit.author),
+        commit.timestamp,
+        esc(commit.message.lines().next().unwrap_or("")),
+        conflict_note,
+        diff_html,
+    );
+    page("change", user.as_ref(), &body).into_response()
+}
+
+// --- File browser -----------------------------------------------------------
+
+/// Resolve a revision (bookmark, tag, or commit id) to a commit id, then load
+/// the object store + root tree, enforcing read access.
+async fn browse_context(
+    state: &AppState,
+    headers: &HeaderMap,
+    owner: &str,
+    name: &str,
+    rev: &str,
+) -> Result<(ObjectStore, ObjectId, Option<User>), Response> {
+    let user = current_user(state, headers).await;
+    let Some(repo) = state.db.find_repo(owner, name).await.ok().flatten() else {
+        return Err(not_found(state, user.as_ref()));
+    };
+    if state
+        .db
+        .role_for(&repo, user.as_ref().map(|u| u.id))
+        .await
+        .ok()
+        .flatten()
+        .is_none()
+    {
+        return Err(not_found(state, user.as_ref()));
+    }
+    // Resolve rev: bookmark, then tag, then a raw commit id.
+    let commit_id = match state.db.get_ref(repo.id, false, rev).await.ok().flatten() {
+        Some(t) => ObjectId::from_str(&t).ok(),
+        None => match state.db.get_ref(repo.id, true, rev).await.ok().flatten() {
+            Some(t) => ObjectId::from_str(&t).ok(),
+            None => ObjectId::from_str(rev).ok(),
+        },
+    };
+    let Some(commit_id) = commit_id else {
+        return Err(not_found(state, user.as_ref()));
+    };
+    let Ok(store) = state.stores.repo_store(owner, name) else {
+        return Err(error_page(state, "store error"));
+    };
+    let Ok(commit) = store.get_commit(&commit_id) else {
+        return Err(not_found(state, user.as_ref()));
+    };
+    Ok((store, commit.tree, user))
+}
+
+/// Navigate from the root tree down `path` (slash-separated directories).
+fn walk_to_tree(
+    store: &ObjectStore,
+    root: &ObjectId,
+    path: &str,
+) -> Option<chip_core::object::Tree> {
+    let mut tree = store.get_tree(root).ok()?;
+    for comp in path.split('/').filter(|s| !s.is_empty()) {
+        let entry = tree.get(comp)?;
+        if entry.kind != EntryKind::Tree {
+            return None;
+        }
+        tree = store.get_tree(&entry.id).ok()?;
+    }
+    Some(tree)
+}
+
+/// Breadcrumb of clickable path segments for a tree/blob view.
+fn breadcrumb(owner: &str, name: &str, rev: &str, path: &str, is_blob: bool) -> String {
+    let mut out = format!(
+        "<div class=\"crumbs\"><a href=\"/{0}/{1}/tree/{2}\">{1}</a>",
+        esc(owner),
+        esc(name),
+        esc(rev)
+    );
+    let comps: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    let mut acc = String::new();
+    for (i, comp) in comps.iter().enumerate() {
+        if !acc.is_empty() {
+            acc.push('/');
+        }
+        acc.push_str(comp);
+        let last = i + 1 == comps.len();
+        if last && is_blob {
+            out.push_str(&format!(" / <span>{}</span>", esc(comp)));
+        } else {
+            out.push_str(&format!(
+                " / <a href=\"/{}/{}/tree/{}/{}\">{}</a>",
+                esc(owner),
+                esc(name),
+                esc(rev),
+                esc(&acc),
+                esc(comp)
+            ));
+        }
+    }
+    out.push_str("</div>");
+    out
+}
+
+async fn tree_root(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((owner, name, rev)): Path<(String, String, String)>,
+) -> Response {
+    render_tree(&state, &headers, &owner, &name, &rev, "").await
+}
+
+async fn tree_sub(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((owner, name, rev, path)): Path<(String, String, String, String)>,
+) -> Response {
+    render_tree(&state, &headers, &owner, &name, &rev, &path).await
+}
+
+async fn render_tree(
+    state: &AppState,
+    headers: &HeaderMap,
+    owner: &str,
+    name: &str,
+    rev: &str,
+    path: &str,
+) -> Response {
+    let (store, root, user) = match browse_context(state, headers, owner, name, rev).await {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    let Some(tree) = walk_to_tree(&store, &root, path) else {
+        return not_found(state, user.as_ref());
+    };
+
+    let mut body = format!(
+        "<h1 style=\"font-size:1.4rem\">{}/{}</h1>\
+         <p class=\"muted\">at <code>{}</code></p>{}",
+        esc(owner),
+        esc(name),
+        esc(rev),
+        breadcrumb(owner, name, rev, path, false)
+    );
+
+    body.push_str("<div class=\"filelist\">");
+    // Parent link.
+    if !path.is_empty() {
+        let parent = path.rsplit_once('/').map(|(p, _)| p).unwrap_or("");
+        let href = if parent.is_empty() {
+            format!("/{owner}/{name}/tree/{rev}")
+        } else {
+            format!("/{owner}/{name}/tree/{rev}/{parent}")
+        };
+        body.push_str(&format!(
+            "<a class=\"filerow\" href=\"{}\">📁 ..</a>",
+            esc(&href)
+        ));
+    }
+    // Directories first, then files (entries are already name-sorted).
+    let mut dirs = Vec::new();
+    let mut files = Vec::new();
+    for entry in &tree.entries {
+        let child = if path.is_empty() {
+            entry.name.clone()
+        } else {
+            format!("{path}/{}", entry.name)
+        };
+        match entry.kind {
+            EntryKind::Tree => dirs.push(format!(
+                "<a class=\"filerow\" href=\"/{}/{}/tree/{}/{}\">📁 {}</a>",
+                esc(owner),
+                esc(name),
+                esc(rev),
+                esc(&child),
+                esc(&entry.name)
+            )),
+            EntryKind::Blob => files.push(format!(
+                "<a class=\"filerow\" href=\"/{}/{}/blob/{}/{}\">📄 {}</a>",
+                esc(owner),
+                esc(name),
+                esc(rev),
+                esc(&child),
+                esc(&entry.name)
+            )),
+        }
+    }
+    for row in dirs.into_iter().chain(files) {
+        body.push_str(&row);
+    }
+    body.push_str("</div>");
+
+    page(&format!("{owner}/{name}"), user.as_ref(), &body).into_response()
+}
+
+async fn blob_view(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((owner, name, rev, path)): Path<(String, String, String, String)>,
+) -> Response {
+    let (store, root, user) = match browse_context(&state, &headers, &owner, &name, &rev).await {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    // Split into parent dir + filename.
+    let (dir, file) = match path.rsplit_once('/') {
+        Some((d, f)) => (d, f),
+        None => ("", path.as_str()),
+    };
+    let Some(tree) = walk_to_tree(&store, &root, dir) else {
+        return not_found(&state, user.as_ref());
+    };
+    let Some(entry) = tree.get(file) else {
+        return not_found(&state, user.as_ref());
+    };
+    if entry.kind != EntryKind::Blob {
+        return not_found(&state, user.as_ref());
+    }
+    let Ok(blob) = store.get_blob(&entry.id) else {
+        return not_found(&state, user.as_ref());
+    };
+
+    let mut body = format!(
+        "<h1 style=\"font-size:1.4rem\">{}</h1>\
+         <p class=\"muted\">at <code>{}</code></p>{}",
+        esc(file),
+        esc(&rev),
+        breadcrumb(&owner, &name, &rev, &path, true)
+    );
+
+    let is_binary = blob.data.iter().take(8192).any(|&b| b == 0);
+    if is_binary {
+        body.push_str(&format!(
+            "<div class=\"empty\">Binary file ({} bytes)</div>",
+            blob.data.len()
+        ));
+    } else {
+        let text = String::from_utf8_lossy(&blob.data);
+        body.push_str("<table class=\"blob\">");
+        for (i, line) in text.lines().enumerate() {
+            body.push_str(&format!(
+                "<tr><td class=\"ln\">{}</td><td class=\"code\">{}</td></tr>",
+                i + 1,
+                esc(line)
+            ));
+        }
+        body.push_str("</table>");
+    }
+
+    page(file, user.as_ref(), &body).into_response()
+}
+
+async fn issue_web_token(db: &Db, user: &User) -> anyhow::Result<String> {
+    let token = auth::generate_token();
+    let hash = auth::hash_token(&token);
+    // Web sessions expire after 30 days (matching the cookie Max-Age).
+    let expires_at = time::OffsetDateTime::now_utc() + time::Duration::days(30);
+    db.create_token(user.id, "web-session", &hash, Some(expires_at))
+        .await?;
+    Ok(token)
+}
+
+fn error_page(_state: &AppState, msg: &str) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        page("error", None, &format!("<h1>Error</h1><p>{}</p>", esc(msg))),
+    )
+        .into_response()
+}
+
+fn not_found(_state: &AppState, user: Option<&User>) -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        page("not found", user, "<h1>404</h1><p>Not found.</p>"),
+    )
+        .into_response()
+}

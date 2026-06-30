@@ -1,0 +1,94 @@
+syntax = "proto3";
+
+package chip;
+
+// The sync + auth service spoken between the `chip` CLI and the chip server.
+service ChipSync {
+  // Account management.
+  rpc Register(RegisterRequest) returns (AuthResponse);
+  rpc Login(LoginRequest) returns (AuthResponse);
+
+  // List a repository's bookmarks and tags (clone/pull negotiation).
+  rpc ListRefs(ListRefsRequest) returns (ListRefsResponse);
+
+  // Stream the objects reachable from `want` but not `have` (download).
+  rpc FetchObjects(FetchRequest) returns (stream ObjectChunk);
+
+  // Upload objects then apply ref updates (push).
+  rpc Push(stream PushRequest) returns (PushResponse);
+}
+
+message RegisterRequest {
+  string username = 1;
+  string email = 2;
+  string password = 3;
+}
+
+message LoginRequest {
+  string username = 1;
+  string password = 2;
+}
+
+message AuthResponse {
+  string token = 1;
+  string username = 2;
+}
+
+message Ref {
+  string name = 1;
+  string target = 2; // commit id, hex
+}
+
+message ListRefsRequest {
+  string owner = 1;
+  string repo = 2;
+}
+
+message ListRefsResponse {
+  repeated Ref bookmarks = 1;
+  repeated Ref tags = 2;
+}
+
+message FetchRequest {
+  string owner = 1;
+  string repo = 2;
+  repeated string want = 3; // commit ids the client wants
+  repeated string have = 4; // commit ids the client already has
+}
+
+// One stored object: `id` is its content hash, `data` the compressed bytes
+// exactly as held in the object store.
+message ObjectChunk {
+  string id = 1;
+  bytes data = 2;
+}
+
+message PushHeader {
+  string owner = 1;
+  string repo = 2;
+}
+
+message RefUpdate {
+  string name = 1;
+  string new_target = 2; // commit id, hex
+  bool is_tag = 3;
+  bool force = 4;        // allow a non-fast-forward update
+}
+
+message RefUpdates {
+  repeated RefUpdate updates = 1;
+}
+
+// A push is a stream: one header, then objects, then the ref updates to apply.
+message PushRequest {
+  oneof body {
+    PushHeader header = 1;
+    ObjectChunk object = 2;
+    RefUpdates updates = 3;
+  }
+}
+
+message PushResponse {
+  bool accepted = 1;
+  string message = 2;
+}

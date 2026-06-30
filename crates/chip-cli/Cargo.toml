@@ -1,0 +1,29 @@
+[package]
+name = "chip-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "chip — a changeset-oriented version control client"
+
+[[bin]]
+name = "chip"
+path = "src/main.rs"
+
+[dependencies]
+chip-core.workspace = true
+chip-proto.workspace = true
+clap.workspace = true
+anyhow.workspace = true
+time.workspace = true
+tokio.workspace = true
+tonic.workspace = true
+prost.workspace = true
+futures.workspace = true
+rpassword = "7"
+russh.workspace = true
+tower = { version = "0.5", features = ["util"] }
+hyper.workspace = true
+hyper-util = { version = "0.1", features = ["tokio"] }
+dirs = "5"

@@ -1,0 +1,54 @@
+# Production stack for a single EC2 instance.
+#
+#   cp .env.production.example .env   # then edit .env
+#   docker compose -f docker-compose.prod.yml up -d --build
+#
+# The server terminates TLS itself (ALPN negotiates HTTP/2 for gRPC and
+# HTTP/1.1 for the web UI on one port), so no reverse proxy is needed.
+# Mount your certificate directory at /certs (read-only).
+
+services:
+  postgres:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: chip
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: chip
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U chip"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  server:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+      CHIP_SECRET: ${CHIP_SECRET}
+      CHIP_DATA_KEY: ${CHIP_DATA_KEY}
+      CHIP_BASE_URL: ${CHIP_BASE_URL}
+      CHIP_OBJECT_STORE: ${CHIP_OBJECT_STORE}
+      CHIP_TLS_CERT: ${CHIP_TLS_CERT}
+      CHIP_TLS_KEY: ${CHIP_TLS_KEY}
+      CHIP_SSH_BIND: ${CHIP_SSH_BIND}
+      CHIP_SSH_HOST_KEY: ${CHIP_SSH_HOST_KEY}
+      CHIP_DB_MAX_CONNECTIONS: ${CHIP_DB_MAX_CONNECTIONS:-25}
+      # S3 (only used when CHIP_OBJECT_STORE is s3://). Prefer an IAM role.
+      AWS_REGION: ${AWS_REGION:-}
+    ports:
+      - "443:8080"     # HTTPS (web + gRPC, native TLS)
+      - "2222:2222"    # SSH transport
+    volumes:
+      - repodata:/data
+      - /etc/letsencrypt/live/${CERT_DOMAIN:-chip.example.com}:/certs:ro
+
+volumes:
+  pgdata:
+  repodata:

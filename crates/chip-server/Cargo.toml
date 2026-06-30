@@ -1,0 +1,58 @@
+[package]
+name = "chip-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "chip-server"
+path = "src/main.rs"
+
+# The server ships as a Docker image, not a downloadable binary.
+[package.metadata.dist]
+dist = false
+
+[dependencies]
+chip-core.workspace = true
+chip-proto.workspace = true
+
+tokio.workspace = true
+tonic.workspace = true
+prost.workspace = true
+axum.workspace = true
+tower.workspace = true
+tower-http.workspace = true
+hyper.workspace = true
+http.workspace = true
+futures.workspace = true
+
+sqlx.workspace = true
+argon2.workspace = true
+uuid.workspace = true
+object_store.workspace = true
+rand.workspace = true
+rand_core.workspace = true
+time.workspace = true
+
+serde.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+bytes = "1"
+
+# Security
+aes-gcm = "0.10"
+hex = "0.4"
+axum-server = { version = "0.7", features = ["tls-rustls"] }
+rustls = "0.23"
+
+# Scaling
+dashmap = "6"
+
+# SSH transport
+russh.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

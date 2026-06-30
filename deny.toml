@@ -1,0 +1,49 @@
+# Configuration for cargo-deny (https://embarkstudios.github.io/cargo-deny/).
+# Run: cargo deny check
+
+[advisories]
+# Fail on security vulnerabilities; surface unmaintained crates as warnings.
+yanked = "deny"
+unmaintained = "workspace"
+ignore = [
+    # RSA Marvin timing sidechannel. No upstream fix exists. Pulled in via the
+    # SSH transport (russh "rsa" feature) for RSA *client* key support. The
+    # server holds no RSA private key (host key is ed25519) and only verifies
+    # signatures (a public-key op), so the private-key timing oracle this
+    # describes is not reachable server-side. See SECURITY.md.
+    "RUSTSEC-2023-0071",
+    # bincode 1.x is unmaintained but stable; it defines our on-disk object
+    # encoding, so a 2.x migration is a deliberate, format-affecting change
+    # tracked separately, not a security fix.
+    "RUSTSEC-2025-0141",
+    # rustls-pemfile unmaintained (folded into rustls-pki-types); transitive,
+    # no behavior impact. Drops out on the next TLS-stack bump.
+    "RUSTSEC-2025-0134",
+]
+
+[licenses]
+# Allow the common permissive licenses used across our dependency tree.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "Zlib",
+    "MPL-2.0",
+    "CC0-1.0",
+    "OpenSSL",
+]
+confidence-threshold = 0.9
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
