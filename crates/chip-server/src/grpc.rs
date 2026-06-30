@@ -10,8 +10,9 @@ use tonic::{Request, Response, Status, Streaming};
 
 use chip_proto::chip_sync_server::ChipSync;
 use chip_proto::{
-    push_request, AuthResponse, FetchRequest, ListRefsRequest, ListRefsResponse, LoginRequest,
-    ObjectChunk, PushRequest, PushResponse, Ref, RegisterRequest,
+    push_request, AuthResponse, CreateRepoRequest, CreateRepoResponse, FetchRequest,
+    ListRefsRequest, ListRefsResponse, LoginRequest, ObjectChunk, PushRequest, PushResponse, Ref,
+    RegisterRequest,
 };
 
 use crate::auth;
@@ -158,6 +159,45 @@ impl ChipSync for ChipService {
         }))
     }
 
+    async fn create_repo(
+        &self,
+        req: Request<CreateRepoRequest>,
+    ) -> Result<Response<CreateRepoResponse>, Status> {
+        let user = self
+            .current_user(&req)
+            .await?
+            .ok_or_else(|| Status::unauthenticated("authentication required"))?;
+        let r = req.into_inner();
+        if r.owner != user.username {
+            return Err(Status::permission_denied(
+                "you can only create repositories under your own account",
+            ));
+        }
+        if !crate::validate::valid_name(&r.repo) {
+            return Err(Status::invalid_argument(
+                "repository name must be 1-64 chars of letters, digits, '-' or '_'",
+            ));
+        }
+        if self
+            .db
+            .find_repo(&r.owner, &r.repo)
+            .await
+            .map_err(internal)?
+            .is_some()
+        {
+            return Err(Status::already_exists("repository already exists"));
+        }
+        let visibility = if r.public { "public" } else { "private" };
+        self.db
+            .create_repo(user.id, &r.repo, visibility, r.description.trim())
+            .await
+            .map_err(internal)?;
+        Ok(Response::new(CreateRepoResponse {
+            created: true,
+            message: format!("created {}/{}", r.owner, r.repo),
+        }))
+    }
+
     async fn list_refs(
         &self,
         req: Request<ListRefsRequest>,
@@ -269,12 +309,28 @@ impl ChipSync for ChipService {
 
         let (owner, name) =
             header.ok_or_else(|| Status::invalid_argument("missing push header"))?;
-        let repo = self
-            .db
-            .find_repo(&owner, &name)
-            .await
-            .map_err(internal)?
-            .ok_or_else(|| Status::not_found("no such repository"))?;
+        let repo = match self.db.find_repo(&owner, &name).await.map_err(internal)? {
+            Some(repo) => repo,
+            // Auto-create on first push: only under your own namespace, only with a
+            // valid name, and always private. Anything else stays "not found".
+            None => {
+                let owns = user.as_ref().map(|u| u.username.as_str()) == Some(owner.as_str());
+                if owns && crate::validate::valid_name(&name) {
+                    let uid = user.as_ref().expect("owns implies authenticated").id;
+                    self.db
+                        .create_repo(uid, &name, "private", "")
+                        .await
+                        .map_err(internal)?;
+                    self.db
+                        .find_repo(&owner, &name)
+                        .await
+                        .map_err(internal)?
+                        .ok_or_else(|| internal("repository vanished after creation"))?
+                } else {
+                    return Err(Status::not_found("no such repository"));
+                }
+            }
+        };
         let role = self
             .db
             .role_for(&repo, user.as_ref().map(|u| u.id))

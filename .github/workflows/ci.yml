@@ -40,3 +40,59 @@ jobs:
 
       - name: Test
         run: cargo test --workspace
+
+  e2e:
+    name: end-to-end
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: chip
+          POSTGRES_PASSWORD: chip
+          POSTGRES_DB: chip
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U chip"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      # The e2e job builds and runs binaries; don't fail it on lint warnings.
+      RUSTFLAGS: ""
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install protoc + psql client
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler postgresql-client
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build binaries
+        run: cargo build --workspace
+
+      - name: Run end-to-end test
+        env:
+          PGHOST: localhost
+          PGPORT: "5432"
+          PGUSER: chip
+          PGPASSWORD: chip
+          PGDATABASE: chip
+        run: bash scripts/e2e.sh
+
+  deny:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+      - name: Check advisories, licenses, bans, sources
+        run: cargo deny check

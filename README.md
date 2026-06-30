@@ -7,10 +7,6 @@
 A changeset-oriented version control system — a Git *alternative*, built from
 scratch in Rust — with a deployable, multi-user server.
 
-> **Note:** `koneb71/chip` in the URLs below is a placeholder — replace it with
-> your actual GitHub path before publishing (it also appears in
-> `Cargo.toml`'s `repository` field and the release installer URLs).
-
 chip is **not** a Git clone. Its model is deliberately different:
 
 - **No staging area.** There is no `add`. The whole working tree is snapshotted
@@ -59,6 +55,37 @@ Or build from source (needs Rust + `protoc`): `cargo install --path crates/chip-
 > transport works everywhere. Releases are produced by cargo-dist
 > (`.github/workflows/release.yml`) on a `v*` tag.
 
+## Quick start
+
+From zero to a synced repository (assumes a server at `http://localhost:8080` —
+see [Server](#server) to run one):
+
+```sh
+# 1. make a local repo and a first change (no staging step)
+mkdir demo && cd demo
+chip init
+echo "# Demo" > README.md
+chip commit -m "first commit"
+
+# 2. create an account on the server
+chip register http://localhost:8080 -u alice -e alice@example.com
+
+# 3. create the remote repo and push to it
+chip repo create http://localhost:8080/alice/demo --description "My first chip repo"
+chip remote add origin http://localhost:8080/alice/demo
+chip push origin
+# (shortcut: skip `repo create` — the first push to your own namespace
+#  auto-creates a private repo)
+
+# 4. clone it somewhere else
+cd .. && chip clone http://localhost:8080/alice/demo demo-clone
+```
+
+Browse the result at `http://localhost:8080/alice/demo`.
+
+<!-- TODO: record an asciinema cast of the above and embed it here, e.g.
+     [![asciicast](https://asciinema.org/a/XXXXXX.svg)](https://asciinema.org/a/XXXXXX) -->
+
 ## CLI
 
 ```sh
@@ -85,10 +112,11 @@ chip op log                   # list recorded operations
 # Remotes — HTTP (token) or SSH (key)
 chip register <url> -u alice -e a@x.com   # HTTP; password prompted if -p omitted
 chip login <url> -u alice
+chip repo create <url>/alice/proj [--public] [--description "…"]  # create a server repo
 chip clone http://host:8080/alice/proj    # HTTP transport (bearer token)
 chip clone ssh://chip@host:2222/alice/proj # SSH transport (your key)
 chip remote add origin <url>/alice/proj
-chip push origin [--force]    # --force allows a non-fast-forward update
+chip push origin [--force]    # first push to your own namespace auto-creates the repo
 chip pull origin              # fast-forward; warns (never clobbers) on divergence
 chip pull origin --rebase     # on divergence, rebase local changes onto the remote
 chip pull origin --merge      # on divergence, create a merge commit

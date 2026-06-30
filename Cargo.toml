@@ -17,8 +17,8 @@ authors = ["chip contributors"]
 repository = "https://github.com/koneb71/chip"
 
 [workspace.dependencies]
-chip-core = { path = "crates/chip-core" }
-chip-proto = { path = "crates/chip-proto" }
+chip-core = { path = "crates/chip-core", version = "0.1.0" }
+chip-proto = { path = "crates/chip-proto", version = "0.1.0" }
 
 # Hashing / compression / serialization
 blake3 = "1"

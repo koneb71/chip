@@ -27,6 +27,7 @@ pub struct Repo {
     pub owner: String,
     pub name: String,
     pub visibility: String,
+    pub description: String,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -334,21 +335,26 @@ impl Db {
         owner_id: Uuid,
         name: &str,
         visibility: &str,
+        description: &str,
     ) -> anyhow::Result<Uuid> {
         let id = Uuid::new_v4();
-        sqlx::query("INSERT INTO repos (id, owner_id, name, visibility) VALUES ($1, $2, $3, $4)")
-            .bind(id)
-            .bind(owner_id)
-            .bind(name)
-            .bind(visibility)
-            .execute(&self.pool)
-            .await?;
+        sqlx::query(
+            "INSERT INTO repos (id, owner_id, name, visibility, description) \
+             VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind(id)
+        .bind(owner_id)
+        .bind(name)
+        .bind(visibility)
+        .bind(description)
+        .execute(&self.pool)
+        .await?;
         Ok(id)
     }
 
     pub async fn find_repo(&self, owner: &str, name: &str) -> anyhow::Result<Option<Repo>> {
-        let row: Option<(Uuid, Uuid, String, String, String)> = sqlx::query_as(
-            "SELECT r.id, r.owner_id, u.username, r.name, r.visibility \
+        let row: Option<(Uuid, Uuid, String, String, String, String)> = sqlx::query_as(
+            "SELECT r.id, r.owner_id, u.username, r.name, r.visibility, r.description \
              FROM repos r JOIN users u ON u.id = r.owner_id \
              WHERE u.username = $1 AND r.name = $2",
         )
@@ -356,20 +362,23 @@ impl Db {
         .bind(name)
         .fetch_optional(&self.pool)
         .await?;
-        Ok(row.map(|(id, owner_id, owner, name, visibility)| Repo {
-            id,
-            owner_id,
-            owner,
-            name,
-            visibility,
-        }))
+        Ok(row.map(
+            |(id, owner_id, owner, name, visibility, description)| Repo {
+                id,
+                owner_id,
+                owner,
+                name,
+                visibility,
+                description,
+            },
+        ))
     }
 
     /// Repos visible to `viewer` (None = anonymous): all public repos plus any
     /// the viewer owns or collaborates on.
     pub async fn list_visible_repos(&self, viewer: Option<Uuid>) -> anyhow::Result<Vec<Repo>> {
-        let rows: Vec<(Uuid, Uuid, String, String, String)> = sqlx::query_as(
-            "SELECT DISTINCT r.id, r.owner_id, u.username, r.name, r.visibility \
+        let rows: Vec<(Uuid, Uuid, String, String, String, String)> = sqlx::query_as(
+            "SELECT DISTINCT r.id, r.owner_id, u.username, r.name, r.visibility, r.description \
              FROM repos r JOIN users u ON u.id = r.owner_id \
              LEFT JOIN collaborators c ON c.repo_id = r.id \
              WHERE r.visibility = 'public' OR r.owner_id = $1 OR c.user_id = $1 \
@@ -380,13 +389,16 @@ impl Db {
         .await?;
         Ok(rows
             .into_iter()
-            .map(|(id, owner_id, owner, name, visibility)| Repo {
-                id,
-                owner_id,
-                owner,
-                name,
-                visibility,
-            })
+            .map(
+                |(id, owner_id, owner, name, visibility, description)| Repo {
+                    id,
+                    owner_id,
+                    owner,
+                    name,
+                    visibility,
+                    description,
+                },
+            )
             .collect())
     }
 

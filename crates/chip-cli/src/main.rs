@@ -115,6 +115,11 @@ enum Command {
         #[arg(short, long)]
         password: Option<String>,
     },
+    /// Manage server-side repositories
+    Repo {
+        #[command(subcommand)]
+        command: RepoCommand,
+    },
     /// Manage remotes for this repository
     Remote {
         #[command(subcommand)]
@@ -148,6 +153,21 @@ enum Command {
         /// On divergence, create a merge commit
         #[arg(long)]
         merge: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum RepoCommand {
+    /// Create a repository on a chip server, e.g. http://host:8080/alice/proj
+    Create {
+        /// Repository URL: <server>/<owner>/<name>
+        url: String,
+        /// Make the repository public (default: private)
+        #[arg(long)]
+        public: bool,
+        /// Optional one-line description
+        #[arg(long)]
+        description: Option<String>,
     },
 }
 
@@ -260,6 +280,15 @@ fn run() -> Result<()> {
                 Ok(())
             })
         }
+        Command::Repo { command } => match command {
+            RepoCommand::Create {
+                url,
+                public,
+                description,
+            } => block_on(
+                async move { sync::create_repo(&url, public, description.as_deref()).await },
+            ),
+        },
         Command::Remote { command } => cmd_remote(command),
         Command::Clone { url, dir } => block_on(async move {
             let parsed = remote::RemoteUrl::parse(&url)?;

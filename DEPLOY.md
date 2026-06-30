@@ -134,3 +134,65 @@ chip clone ssh://chip@chip.example.com:2222/<owner>/<repo>  # SSH + key
   a **Network Load Balancer** (L4 TCP passthrough on 443/2222) and terminate TLS
   on the server as above, or terminate ACM TLS at the NLB and run the server
   plaintext behind it (set `CHIP_COOKIE_SECURE=1`).
+
+## 8. Backup & restore
+
+chip's durable state lives in **three** places, and all three are needed to
+restore a working instance:
+
+| What | Where | Why it matters |
+| ---- | ----- | -------------- |
+| **Secrets** — `CHIP_DATA_KEY`, `CHIP_SECRET` | your `.env` / secrets manager | Object data is AES-256-GCM encrypted; **without the exact `CHIP_DATA_KEY` every repository is permanently unreadable.** |
+| **Metadata** | PostgreSQL (`pgdata` volume or RDS) | Accounts, tokens, repos, collaborators, refs, SSH keys. |
+| **Object data** | object store (`repodata` volume or S3 bucket) | The content-addressed, encrypted commit/tree/blob objects. |
+
+> ⚠ **Back up `CHIP_DATA_KEY` first, offline, and separately from the data.** It
+> is not stored in the database and cannot be recovered. Treat it like a root
+> password: a secrets manager (AWS Secrets Manager, 1Password, `pass`), not the
+> server's disk. The same applies to `CHIP_SECRET` (sessions/CSRF).
+
+### Taking a backup
+
+```sh
+# 1. Secrets — copy these somewhere safe ONCE; they rarely change.
+grep -E 'CHIP_DATA_KEY|CHIP_SECRET' .env     # store the values in your secrets manager
+
+# 2. Postgres metadata — schedule this (cron / systemd timer).
+docker compose -f docker-compose.prod.yml exec -T postgres \
+  pg_dump -U chip chip | gzip > "chip-db-$(date +%F).sql.gz"
+
+# 3a. Object data on a local volume — snapshot the directory.
+docker run --rm -v chip_repodata:/data -v "$PWD":/backup alpine \
+  tar czf "/backup/chip-objects-$(date +%F).tar.gz" -C /data .
+# 3b. Object data on S3 — enable bucket Versioning + a lifecycle policy, or sync:
+#     aws s3 sync s3://your-bucket s3://your-backup-bucket
+```
+
+Objects are immutable and content-addressed, so object backups are safe to take
+incrementally and at a different cadence than the database. For a consistent
+point-in-time set, back up Postgres **after** the object store (refs only point at
+objects that already exist).
+
+### Restoring
+
+1. Provision a fresh host / Postgres / object store.
+2. **Set the original `CHIP_DATA_KEY` and `CHIP_SECRET`** in `.env` — the *exact*
+   values from the old instance.
+3. Restore Postgres:
+   ```sh
+   gunzip -c chip-db-YYYY-MM-DD.sql.gz | \
+     docker compose -f docker-compose.prod.yml exec -T postgres psql -U chip chip
+   ```
+4. Restore the object store (untar into the `repodata` volume, or point
+   `CHIP_OBJECT_STORE` at the restored S3 bucket).
+5. Start the server. Schema migrations run automatically on boot.
+6. **Verify:** log in to the web UI, open a repository, confirm the file browser
+   renders a blob (proves objects decrypt with the restored key), and do a
+   `chip clone` over HTTP and SSH.
+
+### Rotating the data key
+
+There is no built-in re-encryption tool yet, so **keep `CHIP_DATA_KEY` stable**.
+Rotating it means decrypting every object with the old key and re-encrypting with
+the new one; until that tooling exists, plan key rotation as a maintenance
+migration rather than a routine operation.

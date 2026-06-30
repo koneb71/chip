@@ -217,7 +217,18 @@ code{background:var(--soft);padding:.1rem .35rem;border-radius:6px;font-size:.85
 .repo-card{display:block;color:inherit}
 .repo-card:hover{opacity:1}
 .repo-card .name{font-weight:700;font-size:1.1rem;color:var(--ink)}
+.repo-card .desc{color:var(--ink-soft);font-size:.9rem;margin-top:.35rem}
 .repo-card .meta{color:var(--muted);font-size:.85rem;margin-top:.35rem}
+/* new-repo form */
+.hint{font-size:.85rem;margin:.3rem 0 .1rem}
+.vis-cards{display:flex;flex-direction:column;gap:.6rem;margin:.4rem 0 .2rem}
+.vis-card{display:flex;align-items:flex-start;gap:.6rem;border:1px solid var(--line);
+  border-radius:var(--radius);padding:.7rem .9rem;cursor:pointer;transition:border-color .15s ease}
+.vis-card:hover{border-color:var(--ink-soft)}
+.vis-card:has(input:checked){border-color:var(--ink);box-shadow:0 0 0 1px var(--ink) inset}
+.vis-card input{margin-top:.25rem}
+.vis-card span{display:flex;flex-direction:column}
+.vis-card span span{font-size:.85rem;margin-top:.1rem}
 
 /* auth / narrow forms */
 .narrow{max-width:420px;margin:1.5rem auto}
@@ -452,13 +463,19 @@ async fn index(State(state): State<AppState>, headers: HeaderMap) -> Response {
             } else {
                 "<span class=\"chip\">Private</span>"
             };
+            let desc = if r.description.trim().is_empty() {
+                String::new()
+            } else {
+                format!("<div class=\"desc muted\">{}</div>", esc(&r.description))
+            };
             body.push_str(&format!(
                 "<a class=\"card repo-card\" href=\"/{0}/{1}\">\
-                 <div class=\"name\">{0}/{1}</div>\
+                 <div class=\"name\">{0}/{1}</div>{3}\
                  <div class=\"meta\">{2}</div></a>",
                 esc(&r.owner),
                 esc(&r.name),
-                vis_chip
+                vis_chip,
+                desc
             ));
         }
         body.push_str("</div>");
@@ -601,22 +618,47 @@ struct NewRepo {
     name: String,
     visibility: String,
     #[serde(default)]
+    description: String,
+    #[serde(default)]
     _csrf: String,
 }
+
+/// Cap on a repository description (characters).
+const MAX_DESCRIPTION_LEN: usize = 200;
 
 async fn new_repo_form(State(state): State<AppState>, headers: HeaderMap) -> Response {
     let Some(user) = current_user(&state, &headers).await else {
         return Redirect::to("/login").into_response();
     };
+    let base = esc(state.config.base_url.trim_end_matches('/'));
+    let owner = esc(&user.username);
     let body = format!(
         "<div class=\"card narrow\"><h1>New repository</h1>\
-        <p class=\"muted\">Give it a name and choose who can see it.</p><form method=\"post\">{}\
-        <p><label>Repository name</label><input name=\"name\" placeholder=\"letters, digits, - or _\" required></p>\
-        <p><label>Visibility</label><select name=\"visibility\">\
-        <option value=\"private\">Private — only you and collaborators</option>\
-        <option value=\"public\">Public — anyone can view</option></select></p>\
-        <button type=\"submit\" class=\"btn-primary\" style=\"width:100%;margin-top:.5rem\">Create repository</button></form></div>",
-        csrf_input(csrf_of(&state, &headers).as_deref())
+        <p class=\"muted\">Name it, add an optional description, and choose who can see it.</p>\
+        <form method=\"post\">{csrf}\
+        <p><label>Repository name</label>\
+        <input id=\"repo-name\" name=\"name\" placeholder=\"my-project\" \
+         pattern=\"[A-Za-z0-9_-]{{1,64}}\" autocomplete=\"off\" autofocus required></p>\
+        <p class=\"hint muted\">Letters, digits, <code>-</code> or <code>_</code> · 1–64 characters.</p>\
+        <p class=\"hint muted\">Will be created at <code>{base}/{owner}/<span id=\"repo-url-name\">…</span></code></p>\
+        <p><label>Description <span class=\"muted\">(optional)</span></label>\
+        <input name=\"description\" maxlength=\"{maxlen}\" placeholder=\"A short summary of this repository\"></p>\
+        <label>Visibility</label>\
+        <div class=\"vis-cards\">\
+          <label class=\"vis-card\"><input type=\"radio\" name=\"visibility\" value=\"private\" checked>\
+            <span><strong>Private</strong><span class=\"muted\">Only you and collaborators can see it.</span></span></label>\
+          <label class=\"vis-card\"><input type=\"radio\" name=\"visibility\" value=\"public\">\
+            <span><strong>Public</strong><span class=\"muted\">Anyone can view it.</span></span></label>\
+        </div>\
+        <button type=\"submit\" class=\"btn-primary\" style=\"width:100%;margin-top:1rem\">Create repository</button>\
+        </form></div>\
+        <script>(function(){{var n=document.getElementById('repo-name'),\
+        o=document.getElementById('repo-url-name');if(n&&o){{var f=function(){{\
+        o.textContent=n.value||'…';}};n.addEventListener('input',f);f();}}}})();</script>",
+        csrf = csrf_input(csrf_of(&state, &headers).as_deref()),
+        base = base,
+        owner = owner,
+        maxlen = MAX_DESCRIPTION_LEN,
     );
     page("new repo", Some(&user), &body).into_response()
 }
@@ -638,12 +680,20 @@ async fn new_repo_submit(
             "repository name must be 1-64 chars of letters, digits, '-' or '_'",
         );
     }
+    let description = form.description.trim();
+    if description.chars().count() > MAX_DESCRIPTION_LEN {
+        return error_page(&state, "description is too long (max 200 characters)");
+    }
     let visibility = if form.visibility == "public" {
         "public"
     } else {
         "private"
     };
-    match state.db.create_repo(user.id, &form.name, visibility).await {
+    match state
+        .db
+        .create_repo(user.id, &form.name, visibility, description)
+        .await
+    {
         Ok(_) => Redirect::to(&format!("/{}/{}", user.username, form.name)).into_response(),
         Err(_) => error_page(&state, "could not create repository (name taken?)"),
     }
@@ -895,6 +945,13 @@ async fn repo_overview(
         history.len(),
     );
 
+    if !repo.description.trim().is_empty() {
+        body.push_str(&format!(
+            "<p style=\"margin:-.2rem 0 1.1rem;font-size:1.05rem;color:var(--ink-soft)\">{}</p>",
+            esc(&repo.description)
+        ));
+    }
+
     // Browse files at the default bookmark.
     if let Some((bn, _)) = bookmarks.first() {
         body.push_str(&format!(
@@ -920,6 +977,29 @@ async fn repo_overview(
         esc(&clone_cmd),
         esc(&clone_cmd),
     ));
+
+    // Empty repository: show a push-to-here quickstart instead of bare empty lists.
+    if bookmarks.is_empty() {
+        let remote_url = format!(
+            "{}/{}/{}",
+            state.config.base_url.trim_end_matches('/'),
+            owner,
+            name
+        );
+        let push_cmd = format!("chip remote add origin {remote_url} && chip push origin");
+        body.push_str(&format!(
+            "<div class=\"section\"><div class=\"section-h\">Quick start</div>\
+             <p class=\"muted\">This repository is empty. Push an existing project into it:</p>\
+             <div class=\"clone-box\"><code>{cmd}</code>\
+             <button class=\"btn btn-ghost copy-btn\" \
+             onclick=\"navigator.clipboard.writeText('{cmd}');this.textContent='Copied'\">Copy</button></div>\
+             <p class=\"muted\" style=\"margin-top:.6rem\">You can also create repositories from the CLI \
+             with <code>chip repo create {url}</code>, or clone an existing one with \
+             <code>chip clone {url}</code>.</p></div>",
+            cmd = esc(&push_cmd),
+            url = esc(&remote_url),
+        ));
+    }
 
     // Bookmarks & tags.
     body.push_str("<div class=\"section\"><div class=\"section-h\">Bookmarks</div>");

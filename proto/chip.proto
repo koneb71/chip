@@ -8,6 +8,9 @@ service ChipSync {
   rpc Register(RegisterRequest) returns (AuthResponse);
   rpc Login(LoginRequest) returns (AuthResponse);
 
+  // Create a repository under the authenticated user's namespace.
+  rpc CreateRepo(CreateRepoRequest) returns (CreateRepoResponse);
+
   // List a repository's bookmarks and tags (clone/pull negotiation).
   rpc ListRefs(ListRefsRequest) returns (ListRefsResponse);
 
@@ -32,6 +35,18 @@ message LoginRequest {
 message AuthResponse {
   string token = 1;
   string username = 2;
+}
+
+message CreateRepoRequest {
+  string owner = 1;
+  string repo = 2;
+  bool public = 3;
+  string description = 4;
+}
+
+message CreateRepoResponse {
+  bool created = 1;
+  string message = 2;
 }
 
 message Ref {

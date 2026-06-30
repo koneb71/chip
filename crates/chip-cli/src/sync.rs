@@ -15,8 +15,8 @@ use tonic::Request;
 
 use chip_proto::chip_sync_client::ChipSyncClient;
 use chip_proto::{
-    push_request, FetchRequest, ListRefsRequest, LoginRequest, ObjectChunk, PushHeader,
-    PushRequest, RefUpdate, RefUpdates, RegisterRequest,
+    push_request, CreateRepoRequest, FetchRequest, ListRefsRequest, ListRefsResponse, LoginRequest,
+    ObjectChunk, PushHeader, PushRequest, RefUpdate, RefUpdates, RegisterRequest,
 };
 
 use crate::remote::{self, RemoteUrl, Transport};
@@ -98,6 +98,28 @@ pub async fn login(endpoint: &str, username: &str, password: &str) -> Result<Str
         .into_inner();
     remote::save_token(endpoint, &resp.token)?;
     Ok(resp.username)
+}
+
+pub async fn create_repo(url: &str, public: bool, description: Option<&str>) -> Result<()> {
+    let remote = RemoteUrl::parse(url)?;
+    let token = token_for_remote(&remote)?;
+    let mut client = client_for(&remote).await?;
+    let resp = client
+        .create_repo(authed(
+            token.as_deref(),
+            CreateRepoRequest {
+                owner: remote.owner.clone(),
+                repo: remote.repo.clone(),
+                public,
+                description: description.unwrap_or("").to_string(),
+            },
+        ))
+        .await
+        .map_err(status)?
+        .into_inner();
+    println!("{}", resp.message);
+    println!("  push to it with:  chip remote add origin {url}  &&  chip push origin");
+    Ok(())
 }
 
 pub async fn clone(url: &str, dir: &Path) -> Result<()> {
@@ -194,8 +216,10 @@ pub async fn push(
         .read_bookmark(&name)?
         .with_context(|| format!("no local bookmark '{name}'"))?;
 
-    // Server's current refs become our "have" set.
-    let server_refs = client
+    // Server's current refs become our "have" set. A not-yet-existing repo has
+    // no refs — push will create it server-side (if you own the namespace), so
+    // treat NotFound as an empty ref set rather than an error.
+    let server_refs = match client
         .list_refs(authed(
             token.as_deref(),
             ListRefsRequest {
@@ -204,8 +228,11 @@ pub async fn push(
             },
         ))
         .await
-        .map_err(status)?
-        .into_inner();
+    {
+        Ok(resp) => resp.into_inner(),
+        Err(s) if s.code() == tonic::Code::NotFound => ListRefsResponse::default(),
+        Err(s) => return Err(status(s)),
+    };
     let have: Vec<ObjectId> = server_refs
         .bookmarks
         .iter()
