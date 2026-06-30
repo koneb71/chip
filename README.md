@@ -1,13 +1,13 @@
 # chip
 
-[![CI](https://github.com/your-org/chip/actions/workflows/ci.yml/badge.svg)](https://github.com/your-org/chip/actions/workflows/ci.yml)
+[![CI](https://github.com/koneb71/chip/actions/workflows/ci.yml/badge.svg)](https://github.com/koneb71/chip/actions/workflows/ci.yml)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 [![Rust](https://img.shields.io/badge/rust-stable-orange.svg)](https://www.rust-lang.org)
 
 A changeset-oriented version control system — a Git *alternative*, built from
 scratch in Rust — with a deployable, multi-user server.
 
-> **Note:** `your-org/chip` in the URLs below is a placeholder — replace it with
+> **Note:** `koneb71/chip` in the URLs below is a placeholder — replace it with
 > your actual GitHub path before publishing (it also appears in
 > `Cargo.toml`'s `repository` field and the release installer URLs).
 
@@ -44,12 +44,12 @@ static musl), and Windows (x64) on each tagged release — no Rust or protoc nee
 ```sh
 # macOS / Linux
 curl --proto '=https' --tlsv1.2 -LsSf \
-  https://github.com/your-org/chip/releases/latest/download/chip-cli-installer.sh | sh
+  https://github.com/koneb71/chip/releases/latest/download/chip-cli-installer.sh | sh
 ```
 
 ```powershell
 # Windows (PowerShell)
-powershell -ExecutionPolicy Bypass -c "irm https://github.com/your-org/chip/releases/latest/download/chip-cli-installer.ps1 | iex"
+powershell -ExecutionPolicy Bypass -c "irm https://github.com/koneb71/chip/releases/latest/download/chip-cli-installer.ps1 | iex"
 ```
 
 Or build from source (needs Rust + `protoc`): `cargo install --path crates/chip-cli`.
