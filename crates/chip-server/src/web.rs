@@ -31,6 +31,7 @@ pub struct AppState {
     pub config: Arc<Config>,
     pub limiter: Arc<crate::ratelimit::RateLimiter>,
     pub tokens: Arc<crate::cache::TokenCache>,
+    pub renders: Arc<crate::render_cache::RenderCache>,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -523,6 +524,18 @@ the chip sync protocol over gRPC.</p>
   <li><strong>Universal undo.</strong> <code>chip undo</code> reverses the last
       operation via an operation log.</li>
 </ul>
+
+<h2>Install the CLI</h2>
+<p>Prebuilt <code>chip</code> binaries are published for macOS (arm64/x64), Linux
+(x64/arm64, static musl), and Windows (x64) on each release — no Rust or
+<code>protoc</code> needed.</p>
+<pre># macOS / Linux
+curl --proto '=https' --tlsv1.2 -LsSf \
+  https://github.com/koneb71/chip/releases/latest/download/chip-cli-installer.sh | sh</pre>
+<pre># Windows (PowerShell)
+powershell -ExecutionPolicy Bypass -c "irm https://github.com/koneb71/chip/releases/latest/download/chip-cli-installer.ps1 | iex"</pre>
+<p class="muted">Or build from source (needs Rust and <code>protoc</code>):
+<code>cargo install --path crates/chip-cli</code>.</p>
 
 <h2>Getting started</h2>
 <ol>
@@ -1145,14 +1158,17 @@ async fn repo_overview(
 
     let is_owner = user.as_ref().map(|u| u.id) == Some(repo.owner_id);
 
-    // Load history up front so the metrics can show a change count.
+    // Load history up front so the metrics can show a change count. Cached by the
+    // head commit (a content hash), so a page reload doesn't re-walk history.
     let store = state.stores.repo_store(&owner, &name).ok();
     let history = match (store.as_ref(), bookmarks.first()) {
-        (Some(s), Some((_, head))) => ObjectId::from_str(head)
-            .ok()
-            .and_then(|h| dag::history(s, h).ok())
-            .unwrap_or_default(),
-        _ => Vec::new(),
+        (Some(s), Some((_, head))) => match ObjectId::from_str(head) {
+            Ok(h) => state
+                .renders
+                .history_or_else(h, || dag::history(s, h).unwrap_or_default()),
+            Err(_) => std::sync::Arc::new(Vec::new()),
+        },
+        _ => std::sync::Arc::new(Vec::new()),
     };
 
     let vis_chip = if repo.visibility == "public" {
@@ -1221,13 +1237,22 @@ async fn repo_overview(
         esc(&clone_cmd),
     ));
 
-    // Rendered README from the tip commit, if present.
+    // Rendered README from the tip commit, if present. Cached by the README blob
+    // id (its content), so it isn't re-rendered on every page load.
     if let (Some(store), Some((_, tip))) = (store.as_ref(), history.first()) {
-        if let Some(md) = read_readme(store, &tip.tree) {
+        if let Some((blob_id, md)) = read_readme(store, &tip.tree) {
+            let key = format!("r:{}", blob_id.to_hex());
+            let html = state.renders.get_html(&key).map_or_else(
+                || {
+                    let h = crate::highlight::render_markdown(&md);
+                    state.renders.put_html(key, &h);
+                    h
+                },
+                |h| h.to_string(),
+            );
             body.push_str(&format!(
                 "<div class=\"section\"><div class=\"section-h\">Readme</div>\
-                 <div class=\"card readme\">{}</div></div>",
-                crate::highlight::render_markdown(&md)
+                 <div class=\"card readme\">{html}</div></div>"
             ));
         }
     }
@@ -1405,8 +1430,9 @@ async fn add_collaborator(
 }
 
 /// Find and read a root-level README (`README.md`/`.markdown`/`README`) from a
-/// tree, returning its UTF-8 text if present and decodable.
-fn read_readme(store: &ObjectStore, tree_id: &ObjectId) -> Option<String> {
+/// tree, returning its blob id and UTF-8 text if present and decodable. The blob
+/// id lets callers cache the rendered HTML.
+fn read_readme(store: &ObjectStore, tree_id: &ObjectId) -> Option<(ObjectId, String)> {
     let tree = store.get_tree(tree_id).ok()?;
     let entry = tree.entries.iter().find(|e| {
         e.kind == EntryKind::Blob
@@ -1416,7 +1442,7 @@ fn read_readme(store: &ObjectStore, tree_id: &ObjectId) -> Option<String> {
             )
     })?;
     let blob = store.get_blob(&entry.id).ok()?;
-    String::from_utf8(blob.data).ok()
+    Some((entry.id, String::from_utf8(blob.data).ok()?))
 }
 
 /// Render structured file diffs as an HTML diff view (summary + per-file tables).
@@ -1514,20 +1540,34 @@ async fn change_view(
         Err(_) => return not_found(&state, user.as_ref()),
     };
 
-    // Diff against first parent (or empty tree for a root commit).
+    // Diff against first parent (or empty tree for a root commit). The rendered
+    // HTML is deterministic on (base tree, new tree), so it's cached by that key.
     let base_tree = commit
         .parents
         .first()
         .and_then(|p| store.get_commit(p).ok())
         .map(|c| c.tree);
-    let diff_html = match diff::file_diffs(&store, base_tree.as_ref(), &commit.tree) {
-        Ok(diffs) => render_diff_html(&diffs),
-        Err(e) => {
-            tracing::warn!(
-                "diff render failed for {owner}/{name}@{}: {e}",
-                commit_id.short()
-            );
-            "<p class=\"muted\">(diff unavailable)</p>".to_string()
+    let key = format!(
+        "d:{}:{}",
+        base_tree.map(|t| t.to_hex()).unwrap_or_else(|| "-".into()),
+        commit.tree.to_hex()
+    );
+    let diff_html = if let Some(h) = state.renders.get_html(&key) {
+        h.to_string()
+    } else {
+        match diff::file_diffs(&store, base_tree.as_ref(), &commit.tree) {
+            Ok(diffs) => {
+                let html = render_diff_html(&diffs);
+                state.renders.put_html(key, &html);
+                html
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "diff render failed for {owner}/{name}@{}: {e}",
+                    commit_id.short()
+                );
+                "<p class=\"muted\">(diff unavailable)</p>".to_string()
+            }
         }
     };
 
@@ -1822,19 +1862,28 @@ async fn blob_view(
     } else {
         let text = String::from_utf8_lossy(&blob.data);
         // Syntax-highlight when we recognize the language; otherwise fall back to
-        // plain, escaped line rendering.
-        match crate::highlight::blob_table(file, &text) {
-            Some(html) => body.push_str(&html),
-            None => {
-                body.push_str("<table class=\"blob\">");
-                for (i, line) in text.lines().enumerate() {
-                    body.push_str(&format!(
-                        "<tr><td class=\"ln\">{}</td><td class=\"code\">{}</td></tr>",
-                        i + 1,
-                        esc(line)
-                    ));
+        // plain, escaped line rendering. Highlighting is deterministic on the blob
+        // content + filename, so it's cached by that key.
+        let key = format!("b:{}:{}", entry.id.to_hex(), file);
+        if let Some(html) = state.renders.get_html(&key) {
+            body.push_str(&html);
+        } else {
+            match crate::highlight::blob_table(file, &text) {
+                Some(html) => {
+                    state.renders.put_html(key, &html);
+                    body.push_str(&html);
                 }
-                body.push_str("</table>");
+                None => {
+                    body.push_str("<table class=\"blob\">");
+                    for (i, line) in text.lines().enumerate() {
+                        body.push_str(&format!(
+                            "<tr><td class=\"ln\">{}</td><td class=\"code\">{}</td></tr>",
+                            i + 1,
+                            esc(line)
+                        ));
+                    }
+                    body.push_str("</table>");
+                }
             }
         }
     }
@@ -1858,11 +1907,13 @@ async fn file_history(
         Ok(v) => v,
         Err(resp) => return resp,
     };
-    let history = dag::history(&store, commit_id).unwrap_or_default();
+    let history = state.renders.history_or_else(commit_id, || {
+        dag::history(&store, commit_id).unwrap_or_default()
+    });
 
     let mut rows = String::new();
     let mut count = 0;
-    for (id, commit) in &history {
+    for (id, commit) in history.iter() {
         let Some(cur) = blob_id_at(&store, &commit.tree, &path) else {
             continue; // file not present here
         };
@@ -2147,8 +2198,19 @@ async fn request_detail(
             .flatten()
             .and_then(|b| tree_of(s, &b))
             .or_else(|| tree_of(s, &tgt_id));
+        // Shares the change-view diff cache: same (base, new) trees → same HTML.
+        let key = format!(
+            "d:{}:{}",
+            base_tree.map(|t| t.to_hex()).unwrap_or_else(|| "-".into()),
+            src_tree.to_hex()
+        );
+        if let Some(h) = state.renders.get_html(&key) {
+            return Some(h.to_string());
+        }
         let diffs = diff::file_diffs(s, base_tree.as_ref(), &src_tree).ok()?;
-        Some(render_diff_html(&diffs))
+        let html = render_diff_html(&diffs);
+        state.renders.put_html(key, &html);
+        Some(html)
     };
     let diff_html = match (store.as_ref(), &src, &tgt) {
         (Some(s), Some(src), Some(tgt)) => cr_diff(s, src, tgt)

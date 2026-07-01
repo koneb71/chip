@@ -36,7 +36,11 @@ viable:
   flat regardless of repo size — and the reachability walk is iterative (no
   stack-overflow on deep history).
 - **Browse is cheap.** Per-commit diff stats are cached in `commit_stats` (keyed by
-  the immutable content hash), so repo pages don't recompute diffs.
+  the immutable content hash). An in-process, bounded **render cache**
+  (`render_cache.rs`) additionally memoizes the expensive HTML renders — syntax-
+  highlighted blobs, rendered READMEs, diff HTML, and history walks — keyed by
+  content hash, so repeat views don't recompute. It's per-replica; **Redis** (§4)
+  would only be worth introducing to *share* this cache once you run many replicas.
 - **DB indexes** on the hot queries; configurable pool (`CHIP_DB_MAX_CONNECTIONS`);
   hourly cleanup of expired tokens; `/readyz` + graceful shutdown for rolling deploys.
 

@@ -19,7 +19,7 @@ jobs:
     name: fmt · clippy · test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
@@ -62,7 +62,7 @@ jobs:
       # The e2e job builds and runs binaries; don't fail it on lint warnings.
       RUSTFLAGS: ""
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install protoc + psql client
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler postgresql-client
@@ -89,7 +89,7 @@ jobs:
     name: cargo-deny
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install cargo-deny
         uses: taiki-e/install-action@v2
         with:

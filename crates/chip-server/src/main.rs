@@ -16,6 +16,7 @@ mod db;
 mod grpc;
 mod highlight;
 mod ratelimit;
+mod render_cache;
 mod review;
 mod ssh;
 mod store;
@@ -95,6 +96,9 @@ async fn main() -> anyhow::Result<()> {
         config: Arc::new(config.clone()),
         limiter: limiter.clone(),
         tokens: tokens.clone(),
+        // Bounded in-process cache for expensive, immutable renders (highlighted
+        // blobs, rendered READMEs, diff HTML, history walks).
+        renders: render_cache::RenderCache::new(512, 128),
     };
 
     // gRPC service as an axum router, merged with the web UI on one port.

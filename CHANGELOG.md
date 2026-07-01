@@ -7,6 +7,9 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) from 1.0 onwar
 ## [Unreleased]
 
 ### Added
+- **Render cache**: a bounded in-process LRU memoizes the expensive, immutable web
+  renders — syntax-highlighted blobs, rendered READMEs, diff HTML, and history
+  walks — keyed by content hash (no invalidation needed). No new infrastructure.
 - **Git import**: `chip import git <path> [dir]` imports a local Git repository's
   history into a new chip repo — Git blobs/trees/commits map to chip objects with
   author, message, timestamp, parents, branches (→ bookmarks) and tags preserved
