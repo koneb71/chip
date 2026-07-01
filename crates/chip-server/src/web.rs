@@ -527,13 +527,20 @@ the chip sync protocol over gRPC.</p>
 <h2>Getting started</h2>
 <ol>
   <li><a href="/register">Create an account</a> (or <a href="/login">log in</a>).</li>
-  <li>Create an <a href="/settings/tokens">API token</a> for the CLI.</li>
-  <li>Authenticate the CLI, then clone a repository:</li>
+  <li>Pick how the CLI authenticates:
+    <ul>
+      <li><strong>HTTP</strong> — create an <a href="/settings/tokens">API token</a>
+          and run <code>chip login</code> (the token is stored locally).</li>
+      <li><strong>SSH</strong> — add your public key under
+          <a href="/settings/keys">SSH keys</a>; no token needed.</li>
+    </ul>
+  </li>
+  <li>Create a repository from <a href="/new">New repository</a> (or
+      <code>chip repo create</code>), then push to it.</li>
 </ol>
-<pre>chip login {base} -u {owner}
-chip clone {base}/{owner}/&lt;repo&gt;</pre>
-<p>Create a repository from the <a href="/new">New repository</a> page, then push
-to it.</p>
+<pre>chip register {base} -u {owner} -e you@example.com   # or: chip login {base} -u {owner}
+chip clone {base}/{owner}/&lt;repo&gt;                      # over HTTP (bearer token)
+chip clone ssh://chip@&lt;host&gt;/{owner}/&lt;repo&gt;            # over SSH (your key)</pre>
 
 <h2>Everyday workflow</h2>
 <p>There is no staging step — edit files, then commit the whole tree.</p>
@@ -553,9 +560,32 @@ chip merge &lt;name|commit&gt;      # three-way merge (conflicts stay first-clas
 chip rebase &lt;name|commit&gt;     # replay the branch onto a new base (keeps change-ids)
 chip cherry-pick &lt;rev&gt;        # copy one commit's change onto the current change
 chip amend [-m msg]           # rewrite the current change, keeping its change-id
-chip resolve                  # clear resolved conflict markers</pre>
+chip resolve                  # clear resolved conflict markers
+chip stack                    # show the stack of changes above the trunk
+chip evolution [rev]          # a change's versions over time (across amend/rebase)</pre>
 <p class="muted">A <code>rev</code> may be a bookmark, tag, <code>@</code>, or a
 commit id — abbreviated ids (the 12-char prefix in <code>chip log</code>) work too.</p>
+
+<h2>Browsing on the web</h2>
+<p>A repository's page shows its bookmarks, tags, recent changes, and a rendered
+<code>README.md</code>. From there:</p>
+<ul>
+  <li><strong>Browse files</strong> — navigate the tree and open blobs with
+      <strong>syntax highlighting</strong>.</li>
+  <li>Open any change to see its <strong>diff</strong>; open a file's
+      <strong>History</strong> to see the commits that changed it.</li>
+  <li>URLs take a revision (bookmark, tag, or commit id), e.g.
+      <code>/{owner}/&lt;repo&gt;/tree/main</code>.</li>
+</ul>
+
+<h2>Change requests</h2>
+<p>Propose merging one bookmark into another on a repository's <strong>Change
+requests</strong> page: review the combined diff, comment, approve or request
+changes, and merge in the browser. Merges are three-way and keep conflicts
+first-class (a conflicting merge is surfaced, not forced).</p>
+
+<h2>Coming from Git</h2>
+<pre>chip import git &lt;path&gt; [dir]  # import a local Git repo's full history into chip</pre>
 
 <h2>Working with this server</h2>
 <pre>chip remote add origin {base}/{owner}/&lt;repo&gt;
@@ -563,6 +593,17 @@ chip push origin [--force]    # --force allows a non-fast-forward update
 chip pull origin              # fast-forward; warns (never clobbers) on divergence
 chip pull origin --rebase     # on divergence, rebase local changes onto the remote
 chip pull origin --merge      # on divergence, create a merge commit</pre>
+<p class="muted">The first push to a repository under your own account creates it
+automatically. HTTP remotes use a bearer <a href="/settings/tokens">token</a>; SSH
+remotes use your <a href="/settings/keys">key</a>.</p>
+
+<h2>Settings</h2>
+<ul>
+  <li><a href="/settings/tokens">API tokens</a> — create and revoke tokens that
+      authenticate the CLI over HTTP (optionally set an expiry).</li>
+  <li><a href="/settings/keys">SSH keys</a> — add your public key to clone, push,
+      and pull over SSH without a token.</li>
+</ul>
 
 <h2>Access &amp; security</h2>
 <p>Repositories are public or private, with read/write collaborators managed by

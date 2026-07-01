@@ -17,8 +17,14 @@ chip is **not** a Git clone. Its model is deliberately different:
   *conflicted change* you keep working with, then resolve with a normal commit.
 - **Universal undo.** Every mutating command records an operation; `chip undo`
   reverses the last one.
+- **Stacked changes & evolution.** Because change-ids are stable, `chip stack`
+  visualizes a chain of dependent changes and `chip evolution` shows a change's
+  versions over time (across `amend`/`rebase`).
 - **Content-addressed store** (BLAKE3 + zstd) behind a pluggable backend:
   local filesystem today, S3-compatible object storage (MinIO/AWS) by config.
+
+Coming from Git? `chip import git <path>` brings an existing repo's full history
+(branches, tags, authors, dates) into chip.
 
 ## Workspace layout
 
@@ -155,9 +161,19 @@ $ chip amend -m done        # change cc7ae5…  commit 367eed…   (same change,
 ## Server
 
 The server hosts repositories, authenticates the CLI with bearer tokens, serves
-a web UI to browse changes/diffs (plus a public `/docs` page), and enforces
-per-repo access control (public/private + read/write collaborators). gRPC and the web UI are
-multiplexed on **one port**, so a deployment needs a single mapped domain.
+a web UI, and enforces per-repo access control (public/private + read/write
+collaborators). gRPC and the web UI are multiplexed on **one port**, so a
+deployment needs a single mapped domain.
+
+The web UI includes:
+
+- **Change requests** — propose merging one bookmark into another, review the
+  combined diff, comment, approve / request changes, and **merge in-browser** (a
+  server-side three-way merge; conflicts stay first-class and are surfaced rather
+  than force-merged).
+- **Code browser** — file tree and blob views with **syntax highlighting**, a
+  rendered (sanitized) README on the repo page, and per-file **history**.
+- Change/diff views, a repository overview, and token/SSH-key settings.
 
 Safeguards: passwords are Argon2-hashed; CLI tokens are stored only as BLAKE3
 hashes (revocable); pushes are **fast-forward by default** (a non-fast-forward

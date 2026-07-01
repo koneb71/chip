@@ -26,6 +26,10 @@ companion to the user-facing [README](README.md) and the operational guides
 - [The server](#the-server)
 - [Transports: HTTP and SSH](#transports-http-and-ssh)
 - [Authentication & access control](#authentication--access-control)
+- [Change requests & server-side merge](#change-requests--server-side-merge)
+- [Change evolution & stacks](#change-evolution--stacks)
+- [Web code browser](#web-code-browser)
+- [Git import](#git-import)
 - [Statelessness & scaling](#statelessness--scaling)
 
 ## Design principles
@@ -63,10 +67,10 @@ chip is a Cargo workspace of four crates with a strict dependency direction
 
 | Crate | Responsibility | Notable modules |
 | ----- | -------------- | --------------- |
-| `chip-core` | The version-control engine. Pure logic, no I/O beyond the local filesystem. | `object`, `hash`, `change`, `store/`, `refs`, `working_copy`, `merge`, `dag`, `diff`, `oplog`, `ops` |
-| `chip-cli` | The `chip` binary: local commands plus the sync client. | `main`, `sync`, `remote`, `ssh`, `render` |
+| `chip-core` | The version-control engine. Pure logic, no I/O beyond the local filesystem. | `object`, `hash`, `change`, `store/`, `refs`, `working_copy`, `merge`, `dag`, `diff`, `oplog`, `evolution`, `ops` |
+| `chip-cli` | The `chip` binary: local commands, the sync client, and Git import. | `main`, `sync`, `remote`, `ssh`, `render`, `import` |
 | `chip-proto` | gRPC service + message definitions, compiled from `proto/chip.proto` by `build.rs` (needs `protoc`). | generated |
-| `chip-server` | The deployable host: gRPC sync, axum web UI, Postgres auth, SSH transport, encryption. | `grpc`, `web`, `db`, `auth`, `crypto`, `store`, `ssh`, `ratelimit`, `cache`, `config`, `validate` |
+| `chip-server` | The deployable host: gRPC sync, axum web UI, Postgres auth, SSH transport, encryption. | `grpc`, `web`, `db`, `auth`, `crypto`, `store`, `ssh`, `review`, `highlight`, `ratelimit`, `cache`, `config`, `validate` |
 
 ## The object model
 
@@ -207,9 +211,10 @@ stored layout per object:  [ version:1 ][ nonce:12 ][ ciphertext + GCM tag ]
 ├── refs/
 │   ├── bookmarks/       # one file per bookmark → commit hex
 │   └── tags/            # one file per tag → commit hex
-└── oplog/
-    ├── count            # highest sequence number
-    └── 00000001 …       # one bincode record per operation
+├── oplog/
+│   ├── count            # highest sequence number
+│   └── 00000001 …       # one bincode record per operation
+└── evolution           # append-only "change_id old_commit new_commit ts" edges
 ```
 
 The working tree is everything *outside* `.chip` (minus `.chipignore` matches).
@@ -392,6 +397,59 @@ identically regardless of transport.
 - **Input validation**: usernames and repo names are restricted to
   `[A-Za-z0-9_-]{1,64}` ([`validate.rs`](crates/chip-server/src/validate.rs)),
   which structurally prevents path traversal into the object store.
+
+## Change requests & server-side merge
+
+A change request proposes merging one bookmark (`source`) into another (`target`)
+with review. Its metadata lives in Postgres (`change_requests`, `cr_comments`,
+`cr_reviews`; migration `0006`), while the diff and merge come from the object
+store.
+
+The key property: **the server has no working copy, yet it can merge**. The web
+"Merge" button ([`review.rs`](crates/chip-server/src/review.rs)) computes
+`dag::merge_base(source, target)`, calls `merge::merge_trees` on the two tips'
+trees, writes a merge `Commit` via the repo's `ObjectStore`, and advances the
+target bookmark in Postgres (`db.set_ref`) — all over content-addressed objects,
+no checkout required. Fast-forwards are detected and skip the merge commit.
+
+- The reviewed diff is a **three-dot** diff (`merge-base → source`), so commits
+  that land on the target after branching don't appear as spurious deletions.
+- **Conflicts stay first-class**: a conflicting merge is *surfaced* ("resolve
+  locally") rather than force-applied, matching chip's model. Write access +
+  CSRF are required to merge.
+
+## Change evolution & stacks
+
+Because a change-id is stable across rewrites, two features fall out cheaply:
+
+- **Stacks.** `chip stack` walks the first-parent chain from `HEAD` down to the
+  merge-base with the trunk, listing the dependent changes above it. Restacking is
+  just `ops::rebase`, which already replays that chain preserving change-ids.
+- **Evolution.** [`evolution.rs`](crates/chip-core/src/evolution.rs) is an
+  append-only log of `(change_id, old_commit → new_commit)` edges, written
+  (best-effort) whenever `amend`/`rebase` rewrite a change. `chip evolution`
+  reconstructs a change's sequence of commit versions from these edges — the
+  change-id stays fixed while the content hash moves. The log is local today;
+  syncing it (and a web timeline) is a planned follow-up.
+
+## Web code browser
+
+The blob view syntax-highlights recognized languages with `syntect` (pure-Rust
+`fancy-regex`, no C `onig`), falling back to plain escaped text otherwise, and the
+repo overview renders the root `README.md` as Markdown. All rendering is in
+[`highlight.rs`](crates/chip-server/src/highlight.rs); README HTML is **sanitized
+with `ammonia`**, so untrusted content can't inject scripts. A per-file **history**
+view lists the commits whose version of a file differs from their first parent's.
+
+## Git import
+
+[`chip-cli/src/import.rs`](crates/chip-cli/src/import.rs) imports a **local** Git
+repo with `gix` (pure-Rust; no network/C deps). Git blobs/trees/commits map onto
+chip's — content bytes are identical (re-hashed with BLAKE3), author/message/
+timestamp/parents are preserved, branches become bookmarks and tags become tags —
+with a fresh change-id per commit. The commit walk is iterative (an explicit work
+stack) so deep histories don't overflow. Symlinks/submodules are skipped and
+counted; remotes are cloned first with `git clone`.
 
 ## Statelessness & scaling
 
