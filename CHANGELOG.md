@@ -6,6 +6,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) from 1.0 onwar
 
 ## [Unreleased]
 
+## [0.0.2] — 2026-07-01
+
 ### Added
 - **Render cache**: a bounded in-process LRU memoizes the expensive, immutable web
   renders — syntax-highlighted blobs, rendered READMEs, diff HTML, and history
@@ -78,5 +80,6 @@ Initial release: a changeset-oriented version control system (a Git
 - Cross-platform release binaries + installers via cargo-dist (macOS arm64/x64,
   Linux x64/arm64 musl, Windows x64).
 
-[Unreleased]: https://github.com/koneb71/chip/compare/v0.0.1...HEAD
+[Unreleased]: https://github.com/koneb71/chip/compare/v0.0.2...HEAD
+[0.0.2]: https://github.com/koneb71/chip/compare/v0.0.1...v0.0.2
 [0.0.1]: https://github.com/koneb71/chip/releases/tag/v0.0.1

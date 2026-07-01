@@ -585,7 +585,7 @@ dependencies = [
 
 [[package]]
 name = "chip-cli"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "anyhow",
  "chip-core",
@@ -607,7 +607,7 @@ dependencies = [
 
 [[package]]
 name = "chip-core"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "anyhow",
  "bincode",
@@ -626,7 +626,7 @@ dependencies = [
 
 [[package]]
 name = "chip-proto"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "prost",
  "tonic",
@@ -635,7 +635,7 @@ dependencies = [
 
 [[package]]
 name = "chip-server"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "aes-gcm 0.10.3",
  "ammonia",
