@@ -53,6 +53,18 @@ pub fn router(state: AppState) -> Router {
         .route("/:owner/:repo/tree/:rev", get(tree_root))
         .route("/:owner/:repo/tree/:rev/*path", get(tree_sub))
         .route("/:owner/:repo/blob/:rev/*path", get(blob_view))
+        .route("/:owner/:repo/history/:rev/*path", get(file_history))
+        .route("/:owner/:repo/requests", get(requests_list))
+        .route(
+            "/:owner/:repo/requests/new",
+            get(new_request_form).post(new_request_submit),
+        )
+        .route(
+            "/:owner/:repo/requests/:num",
+            get(request_detail).post(comment_submit),
+        )
+        .route("/:owner/:repo/requests/:num/merge", post(merge_submit))
+        .route("/:owner/:repo/requests/:num/review", post(review_submit))
         .layer(middleware::from_fn(security_headers))
         .with_state(state)
 }
@@ -309,7 +321,11 @@ button:focus-visible,.btn:focus-visible{outline:none;box-shadow:0 0 0 3px var(--
   font-weight:600;margin:.2rem .35rem .2rem 0;color:var(--ink);
   transition:transform .15s,border-color .15s}
 .chip:hover{transform:translateY(-1px);border-color:var(--ink)}
+.chip-open{background:var(--accent-soft);border-color:var(--accent);color:var(--accent-strong)}
+.chip-merged{background:#ecfdf3;border-color:#63b47f;color:#116932}
 .tag{color:var(--ink)}
+.cr-actions{display:flex;gap:.6rem;flex-wrap:wrap;align-items:center}
+.cr-actions form{margin:0}
 
 /* tables / lists */
 table{border-collapse:collapse;width:100%}
@@ -413,6 +429,20 @@ table.blob tr:hover{background:var(--soft)}
 .prose h2:first-of-type{border-top:0;padding-top:0}
 .prose ul,.prose ol{padding-left:1.2rem}
 .prose li{margin:.3rem 0}
+
+/* rendered README */
+.readme{padding:1.5rem 1.7rem}
+.readme>:first-child{margin-top:0}
+.readme h1{font-size:1.5rem}
+.readme h2{font-size:1.25rem;border-top:1px solid var(--line);padding-top:1rem;margin-top:1.4rem}
+.readme ul,.readme ol{padding-left:1.3rem}
+.readme li{margin:.25rem 0}
+.readme pre{overflow:auto}
+.readme img{max-width:100%}
+.readme a{color:var(--accent);font-weight:500}
+.readme table{width:auto;border-collapse:collapse}
+.readme th,.readme td{border:1px solid var(--line);padding:.4rem .65rem}
+.readme blockquote{margin:.6rem 0;padding:.2rem 1rem;border-left:3px solid var(--line);color:var(--muted)}
 
 /* token reveal */
 .reveal{display:flex;align-items:center;gap:.6rem;background:var(--soft);
@@ -1118,7 +1148,8 @@ async fn repo_overview(
         ));
     }
 
-    // Browse files at the default bookmark.
+    // Browse files at the default bookmark + change requests.
+    body.push_str("<div style=\"display:flex;gap:.6rem;flex-wrap:wrap\">");
     if let Some((bn, _)) = bookmarks.first() {
         body.push_str(&format!(
             "<a class=\"btn btn-primary\" href=\"/{}/{}/tree/{}\">Browse files</a>",
@@ -1127,6 +1158,11 @@ async fn repo_overview(
             esc(bn)
         ));
     }
+    body.push_str(&format!(
+        "<a class=\"btn btn-ghost\" href=\"/{}/{}/requests\">Change requests</a></div>",
+        esc(&owner),
+        esc(&name),
+    ));
 
     // Clone box with a copy button.
     let clone_cmd = format!(
@@ -1143,6 +1179,17 @@ async fn repo_overview(
         esc(&clone_cmd),
         esc(&clone_cmd),
     ));
+
+    // Rendered README from the tip commit, if present.
+    if let (Some(store), Some((_, tip))) = (store.as_ref(), history.first()) {
+        if let Some(md) = read_readme(store, &tip.tree) {
+            body.push_str(&format!(
+                "<div class=\"section\"><div class=\"section-h\">Readme</div>\
+                 <div class=\"card readme\">{}</div></div>",
+                crate::highlight::render_markdown(&md)
+            ));
+        }
+    }
 
     // Empty repository: show a push-to-here quickstart instead of bare empty lists.
     if bookmarks.is_empty() {
@@ -1316,6 +1363,21 @@ async fn add_collaborator(
     Redirect::to(&format!("/{owner}/{name}")).into_response()
 }
 
+/// Find and read a root-level README (`README.md`/`.markdown`/`README`) from a
+/// tree, returning its UTF-8 text if present and decodable.
+fn read_readme(store: &ObjectStore, tree_id: &ObjectId) -> Option<String> {
+    let tree = store.get_tree(tree_id).ok()?;
+    let entry = tree.entries.iter().find(|e| {
+        e.kind == EntryKind::Blob
+            && matches!(
+                e.name.to_ascii_lowercase().as_str(),
+                "readme.md" | "readme.markdown" | "readme"
+            )
+    })?;
+    let blob = store.get_blob(&entry.id).ok()?;
+    String::from_utf8(blob.data).ok()
+}
+
 /// Render structured file diffs as an HTML diff view (summary + per-file tables).
 fn render_diff_html(diffs: &[chip_core::diff::FileDiff]) -> String {
     use chip_core::diff::{FileStatus, LineKind};
@@ -1465,7 +1527,7 @@ async fn browse_context(
     owner: &str,
     name: &str,
     rev: &str,
-) -> Result<(ObjectStore, ObjectId, Option<User>), Response> {
+) -> Result<BrowseContext, Response> {
     let user = current_user(state, headers).await;
     let Some(repo) = state.db.find_repo(owner, name).await.ok().flatten() else {
         return Err(not_found(state, user.as_ref()));
@@ -1497,7 +1559,32 @@ async fn browse_context(
     let Ok(commit) = store.get_commit(&commit_id) else {
         return Err(not_found(state, user.as_ref()));
     };
-    Ok((store, commit.tree, user))
+    Ok(BrowseContext {
+        store,
+        commit_id,
+        root: commit.tree,
+        user,
+    })
+}
+
+/// Resolved context for a browse request: the store, the resolved commit, its
+/// root tree, and the (optional) viewer.
+struct BrowseContext {
+    store: ObjectStore,
+    commit_id: ObjectId,
+    root: ObjectId,
+    user: Option<User>,
+}
+
+/// The blob id at `path` within a tree, or `None` if the path is absent or a dir.
+fn blob_id_at(store: &ObjectStore, root: &ObjectId, path: &str) -> Option<ObjectId> {
+    let (dir, file) = match path.rsplit_once('/') {
+        Some((d, f)) => (d, f),
+        None => ("", path),
+    };
+    let tree = walk_to_tree(store, root, dir)?;
+    let entry = tree.get(file)?;
+    (entry.kind == EntryKind::Blob).then_some(entry.id)
 }
 
 /// Navigate from the root tree down `path` (slash-separated directories).
@@ -1574,7 +1661,9 @@ async fn render_tree(
     rev: &str,
     path: &str,
 ) -> Response {
-    let (store, root, user) = match browse_context(state, headers, owner, name, rev).await {
+    let BrowseContext {
+        store, root, user, ..
+    } = match browse_context(state, headers, owner, name, rev).await {
         Ok(v) => v,
         Err(resp) => return resp,
     };
@@ -1646,7 +1735,9 @@ async fn blob_view(
     headers: HeaderMap,
     Path((owner, name, rev, path)): Path<(String, String, String, String)>,
 ) -> Response {
-    let (store, root, user) = match browse_context(&state, &headers, &owner, &name, &rev).await {
+    let BrowseContext {
+        store, root, user, ..
+    } = match browse_context(&state, &headers, &owner, &name, &rev).await {
         Ok(v) => v,
         Err(resp) => return resp,
     };
@@ -1670,9 +1761,14 @@ async fn blob_view(
 
     let mut body = format!(
         "<h1 style=\"font-size:1.4rem\">{}</h1>\
-         <p class=\"muted\">at <code>{}</code></p>{}",
+         <p class=\"muted\">at <code>{}</code> · \
+         <a class=\"link\" href=\"/{}/{}/history/{}/{}\">History</a></p>{}",
         esc(file),
         esc(&rev),
+        esc(&owner),
+        esc(&name),
+        esc(&rev),
+        esc(&path),
         breadcrumb(&owner, &name, &rev, &path, true)
     );
 
@@ -1684,18 +1780,575 @@ async fn blob_view(
         ));
     } else {
         let text = String::from_utf8_lossy(&blob.data);
-        body.push_str("<table class=\"blob\">");
-        for (i, line) in text.lines().enumerate() {
-            body.push_str(&format!(
-                "<tr><td class=\"ln\">{}</td><td class=\"code\">{}</td></tr>",
-                i + 1,
-                esc(line)
-            ));
+        // Syntax-highlight when we recognize the language; otherwise fall back to
+        // plain, escaped line rendering.
+        match crate::highlight::blob_table(file, &text) {
+            Some(html) => body.push_str(&html),
+            None => {
+                body.push_str("<table class=\"blob\">");
+                for (i, line) in text.lines().enumerate() {
+                    body.push_str(&format!(
+                        "<tr><td class=\"ln\">{}</td><td class=\"code\">{}</td></tr>",
+                        i + 1,
+                        esc(line)
+                    ));
+                }
+                body.push_str("</table>");
+            }
         }
-        body.push_str("</table>");
     }
 
     page(file, user.as_ref(), &body).into_response()
+}
+
+/// History of a single file: the commits whose version of it differs from their
+/// first parent's (i.e. that changed the file).
+async fn file_history(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((owner, name, rev, path)): Path<(String, String, String, String)>,
+) -> Response {
+    let BrowseContext {
+        store,
+        commit_id,
+        user,
+        ..
+    } = match browse_context(&state, &headers, &owner, &name, &rev).await {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    let history = dag::history(&store, commit_id).unwrap_or_default();
+
+    let mut rows = String::new();
+    let mut count = 0;
+    for (id, commit) in &history {
+        let Some(cur) = blob_id_at(&store, &commit.tree, &path) else {
+            continue; // file not present here
+        };
+        let parent_blob = commit
+            .parents
+            .first()
+            .and_then(|p| store.get_commit(p).ok())
+            .and_then(|pc| blob_id_at(&store, &pc.tree, &path));
+        // Include when the file was introduced (no parent version) or changed.
+        if parent_blob == Some(cur) {
+            continue;
+        }
+        count += 1;
+        let date = time::OffsetDateTime::from_unix_timestamp(commit.timestamp)
+            .map(fmt_ts)
+            .unwrap_or_default();
+        rows.push_str(&format!(
+            "<a class=\"commit-row\" href=\"/{}/{}/change/{}\">\
+             <span class=\"hash\">{}</span>\
+             <div class=\"commit-main\"><div class=\"commit-msg\">{}</div>\
+             <div class=\"commit-sub\">change {} · {}</div></div></a>",
+            esc(&owner),
+            esc(&name),
+            id.to_hex(),
+            id.short(),
+            esc(commit.message.lines().next().unwrap_or("")),
+            esc(&commit.change_id.to_string()),
+            date,
+        ));
+    }
+
+    let mut body = format!(
+        "<h1 style=\"font-size:1.4rem\">History of {}</h1>\
+         <p class=\"muted\">at <code>{}</code> · \
+         <a class=\"link\" href=\"/{}/{}/blob/{}/{}\">View file</a></p>",
+        esc(&path),
+        esc(&rev),
+        esc(&owner),
+        esc(&name),
+        esc(&rev),
+        esc(&path),
+    );
+    if count == 0 {
+        body.push_str("<div class=\"empty\">No history for this file.</div>");
+    } else {
+        body.push_str(&format!("<div class=\"commit-list\">{rows}</div>"));
+    }
+    page("file history", user.as_ref(), &body).into_response()
+}
+
+// --- Change requests --------------------------------------------------------
+
+/// Load a repo and the viewer's role, or a not-found response. `None` role means
+/// no access.
+async fn repo_and_role(
+    state: &AppState,
+    headers: &HeaderMap,
+    owner: &str,
+    name: &str,
+) -> Result<(crate::db::Repo, Option<Role>, Option<User>), Response> {
+    let user = current_user(state, headers).await;
+    let Some(repo) = state.db.find_repo(owner, name).await.ok().flatten() else {
+        return Err(not_found(state, user.as_ref()));
+    };
+    let role = state
+        .db
+        .role_for(&repo, user.as_ref().map(|u| u.id))
+        .await
+        .ok()
+        .flatten();
+    if role.is_none() {
+        return Err(not_found(state, user.as_ref()));
+    }
+    Ok((repo, role, user))
+}
+
+fn cr_state_chip(state: &str) -> &'static str {
+    match state {
+        "merged" => "<span class=\"chip chip-merged\">Merged</span>",
+        "closed" => "<span class=\"chip\">Closed</span>",
+        _ => "<span class=\"chip chip-open\">Open</span>",
+    }
+}
+
+async fn requests_list(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((owner, name)): Path<(String, String)>,
+) -> Response {
+    let (repo, role, user) = match repo_and_role(&state, &headers, &owner, &name).await {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    let crs = state
+        .db
+        .list_change_requests(repo.id)
+        .await
+        .unwrap_or_default();
+    let actions = if role == Some(Role::Write) {
+        format!("<a class=\"btn btn-primary\" href=\"/{owner}/{name}/requests/new\">+ New change request</a>")
+    } else {
+        String::new()
+    };
+    let mut body = page_head(
+        &format!("Change requests · {}/{}", esc(&owner), esc(&name)),
+        "Propose merging one bookmark into another, with review.",
+        &actions,
+    );
+    if crs.is_empty() {
+        body.push_str("<div class=\"empty\">No change requests yet.</div>");
+    } else {
+        body.push_str("<div class=\"list\">");
+        for cr in crs {
+            body.push_str(&format!(
+                "<div class=\"list-row\"><div class=\"lr-main\">\
+                 <div class=\"lr-name\"><a class=\"link\" href=\"/{o}/{n}/requests/{num}\">#{num} {title}</a></div>\
+                 <div class=\"lr-sub\">{src} → {tgt} · by {author}</div></div>\
+                 <div class=\"lr-meta\">{chip}</div></div>",
+                o = esc(&owner),
+                n = esc(&name),
+                num = cr.number,
+                title = esc(&cr.title),
+                src = esc(&cr.source_ref),
+                tgt = esc(&cr.target_ref),
+                author = esc(&cr.author),
+                chip = cr_state_chip(&cr.state),
+            ));
+        }
+        body.push_str("</div>");
+    }
+    page("change requests", user.as_ref(), &body).into_response()
+}
+
+#[derive(Deserialize)]
+struct NewCr {
+    title: String,
+    #[serde(default)]
+    body: String,
+    source: String,
+    target: String,
+    #[serde(default)]
+    _csrf: String,
+}
+
+async fn new_request_form(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((owner, name)): Path<(String, String)>,
+) -> Response {
+    let (repo, role, user) = match repo_and_role(&state, &headers, &owner, &name).await {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    if role != Some(Role::Write) {
+        return error_page(&state, "you need write access to open a change request");
+    }
+    let bookmarks = state.db.list_refs(repo.id, false).await.unwrap_or_default();
+    if bookmarks.len() < 2 {
+        return error_page(
+            &state,
+            "a change request needs at least two bookmarks to compare",
+        );
+    }
+    let opts = |sel: &str| -> String {
+        bookmarks
+            .iter()
+            .map(|(bn, _)| {
+                let s = if bn == sel { " selected" } else { "" };
+                format!("<option value=\"{0}\"{1}>{0}</option>", esc(bn), s)
+            })
+            .collect()
+    };
+    let default_target = if bookmarks.iter().any(|(n, _)| n == "main") {
+        "main"
+    } else {
+        bookmarks.first().map(|(n, _)| n.as_str()).unwrap_or("")
+    };
+    let body = format!(
+        "{head}<div class=\"card narrow\"><form method=\"post\">{csrf}\
+         <p><label>Title</label><input name=\"title\" placeholder=\"Short summary\" required></p>\
+         <p><label>Description <span class=\"muted\">(optional)</span></label>\
+         <textarea name=\"body\" placeholder=\"What does this change?\"></textarea></p>\
+         <p><label>Merge from</label><select name=\"source\">{src_opts}</select></p>\
+         <p><label>Into</label><select name=\"target\">{tgt_opts}</select></p>\
+         <button type=\"submit\" class=\"btn-primary\">Create change request</button></form></div>",
+        head = page_head("New change request", "", ""),
+        csrf = csrf_input(csrf_of(&state, &headers).as_deref()),
+        src_opts = opts(""),
+        tgt_opts = opts(default_target),
+    );
+    page("new change request", user.as_ref(), &body).into_response()
+}
+
+async fn new_request_submit(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((owner, name)): Path<(String, String)>,
+    Form(form): Form<NewCr>,
+) -> Response {
+    let (repo, role, user) = match repo_and_role(&state, &headers, &owner, &name).await {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    let Some(user) = user else {
+        return Redirect::to("/login").into_response();
+    };
+    if role != Some(Role::Write) {
+        return error_page(&state, "you need write access to open a change request");
+    }
+    if !csrf_ok(&state, &headers, &form._csrf) {
+        return error_page(&state, "invalid CSRF token");
+    }
+    let title = form.title.trim();
+    if title.is_empty() {
+        return error_page(&state, "title is required");
+    }
+    if form.source == form.target {
+        return error_page(&state, "source and target must differ");
+    }
+    match state
+        .db
+        .create_change_request(
+            repo.id,
+            user.id,
+            title,
+            form.body.trim(),
+            &form.source,
+            &form.target,
+        )
+        .await
+    {
+        Ok(num) => Redirect::to(&format!("/{owner}/{name}/requests/{num}")).into_response(),
+        Err(_) => error_page(&state, "could not create change request"),
+    }
+}
+
+async fn request_detail(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((owner, name, num)): Path<(String, String, i32)>,
+) -> Response {
+    let (repo, role, user) = match repo_and_role(&state, &headers, &owner, &name).await {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    let Some(cr) = state
+        .db
+        .get_change_request(repo.id, num)
+        .await
+        .ok()
+        .flatten()
+    else {
+        return not_found(&state, user.as_ref());
+    };
+
+    // Combined diff: what `source` would bring into `target`.
+    let store = state.stores.repo_store(&owner, &name).ok();
+    let src = state
+        .db
+        .get_ref(repo.id, false, &cr.source_ref)
+        .await
+        .ok()
+        .flatten();
+    let tgt = state
+        .db
+        .get_ref(repo.id, false, &cr.target_ref)
+        .await
+        .ok()
+        .flatten();
+    let tree_of = |s: &ObjectStore, hex: &str| -> Option<ObjectId> {
+        ObjectId::from_str(hex)
+            .ok()
+            .and_then(|c| s.get_commit(&c).ok())
+            .map(|c| c.tree)
+    };
+    let diff_html = match (store.as_ref(), &src, &tgt) {
+        (Some(s), Some(src), Some(tgt)) => match (tree_of(s, src), tree_of(s, tgt)) {
+            (Some(st), Some(tt)) => diff::file_diffs(s, Some(&tt), &st)
+                .map(|d| render_diff_html(&d))
+                .unwrap_or_else(|_| "<p class=\"muted\">Diff unavailable.</p>".into()),
+            _ => "<p class=\"muted\">Diff unavailable.</p>".into(),
+        },
+        _ => "<p class=\"muted\">Diff unavailable (a bookmark may have been deleted).</p>".into(),
+    };
+
+    let reviews = state.db.list_cr_reviews(cr.id).await.unwrap_or_default();
+    let comments = state.db.list_cr_comments(cr.id).await.unwrap_or_default();
+    let is_writer = role == Some(Role::Write);
+    let csrf = csrf_of(&state, &headers);
+
+    let mut body = format!(
+        "{head}<p class=\"muted\">{chip} · <code>{src}</code> → <code>{tgt}</code> · \
+         by {author} · opened {date}</p>",
+        head = page_head(&format!("#{} {}", cr.number, esc(&cr.title)), "", ""),
+        chip = cr_state_chip(&cr.state),
+        src = esc(&cr.source_ref),
+        tgt = esc(&cr.target_ref),
+        author = esc(&cr.author),
+        date = fmt_ts(cr.created_at),
+    );
+    if !cr.body.trim().is_empty() {
+        body.push_str(&format!("<p>{}</p>", esc(&cr.body)));
+    }
+
+    // Reviews summary.
+    if !reviews.is_empty() {
+        body.push_str("<div class=\"section\"><div class=\"section-h\">Reviews</div>");
+        for (who, verdict) in &reviews {
+            let label = if verdict == "approve" {
+                "approved"
+            } else {
+                "requested changes"
+            };
+            body.push_str(&format!(
+                "<span class=\"chip\">{} {}</span>",
+                esc(who),
+                label
+            ));
+        }
+        body.push_str("</div>");
+    }
+
+    // Merge + review actions (writers only, open CRs).
+    if is_writer && cr.state == "open" {
+        let cf = csrf_input(csrf.as_deref());
+        body.push_str(&format!(
+            "<div class=\"section\"><div class=\"cr-actions\">\
+             <form method=\"post\" action=\"/{o}/{n}/requests/{num}/merge\">{cf}\
+             <button type=\"submit\" class=\"btn-primary\">Merge</button></form>\
+             <form method=\"post\" action=\"/{o}/{n}/requests/{num}/review\">{cf}\
+             <input type=\"hidden\" name=\"verdict\" value=\"approve\">\
+             <button type=\"submit\" class=\"btn btn-ghost\">Approve</button></form>\
+             <form method=\"post\" action=\"/{o}/{n}/requests/{num}/review\">{cf}\
+             <input type=\"hidden\" name=\"verdict\" value=\"request_changes\">\
+             <button type=\"submit\" class=\"btn btn-ghost\">Request changes</button></form>\
+             </div></div>",
+            o = esc(&owner),
+            n = esc(&name),
+        ));
+    }
+
+    // Comments.
+    body.push_str("<div class=\"section\"><div class=\"section-h\">Discussion</div>");
+    if comments.is_empty() {
+        body.push_str("<p class=\"muted\">No comments yet.</p>");
+    } else {
+        for (who, text, when) in &comments {
+            body.push_str(&format!(
+                "<div class=\"card\" style=\"padding:.8rem 1rem;margin:.5rem 0\">\
+                 <div class=\"lr-sub\" style=\"font-family:inherit\"><strong>{}</strong> · {}</div>\
+                 <div style=\"margin-top:.3rem;white-space:pre-wrap\">{}</div></div>",
+                esc(who),
+                fmt_ts(*when),
+                esc(text),
+            ));
+        }
+    }
+    if user.is_some() {
+        body.push_str(&format!(
+            "<form method=\"post\" style=\"margin-top:.6rem\">{}\
+             <textarea name=\"body\" placeholder=\"Leave a comment\" required></textarea>\
+             <button type=\"submit\" class=\"btn-primary\" style=\"margin-top:.4rem\">Comment</button></form>",
+            csrf_input(csrf.as_deref())
+        ));
+    }
+    body.push_str("</div>");
+
+    // The diff.
+    body.push_str("<div class=\"section\"><div class=\"section-h\">Changes</div>");
+    body.push_str(&diff_html);
+    body.push_str("</div>");
+
+    page("change request", user.as_ref(), &body).into_response()
+}
+
+#[derive(Deserialize)]
+struct CommentForm {
+    body: String,
+    #[serde(default)]
+    _csrf: String,
+}
+
+async fn comment_submit(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((owner, name, num)): Path<(String, String, i32)>,
+    Form(form): Form<CommentForm>,
+) -> Response {
+    let (repo, _role, user) = match repo_and_role(&state, &headers, &owner, &name).await {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    let Some(user) = user else {
+        return Redirect::to("/login").into_response();
+    };
+    if !csrf_ok(&state, &headers, &form._csrf) {
+        return error_page(&state, "invalid CSRF token");
+    }
+    if let Some(cr) = state
+        .db
+        .get_change_request(repo.id, num)
+        .await
+        .ok()
+        .flatten()
+    {
+        let text = form.body.trim();
+        if !text.is_empty() {
+            let _ = state.db.add_cr_comment(cr.id, user.id, text).await;
+        }
+    }
+    Redirect::to(&format!("/{owner}/{name}/requests/{num}")).into_response()
+}
+
+#[derive(Deserialize)]
+struct ReviewForm {
+    verdict: String,
+    #[serde(default)]
+    _csrf: String,
+}
+
+async fn review_submit(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((owner, name, num)): Path<(String, String, i32)>,
+    Form(form): Form<ReviewForm>,
+) -> Response {
+    let (repo, role, user) = match repo_and_role(&state, &headers, &owner, &name).await {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    let Some(user) = user else {
+        return Redirect::to("/login").into_response();
+    };
+    if role != Some(Role::Write) {
+        return error_page(&state, "you need write access to review");
+    }
+    if !csrf_ok(&state, &headers, &form._csrf) {
+        return error_page(&state, "invalid CSRF token");
+    }
+    let verdict = if form.verdict == "approve" {
+        "approve"
+    } else {
+        "request_changes"
+    };
+    if let Some(cr) = state
+        .db
+        .get_change_request(repo.id, num)
+        .await
+        .ok()
+        .flatten()
+    {
+        let _ = state.db.set_cr_review(cr.id, user.id, verdict).await;
+    }
+    Redirect::to(&format!("/{owner}/{name}/requests/{num}")).into_response()
+}
+
+#[derive(Deserialize)]
+struct CsrfOnly {
+    #[serde(default)]
+    _csrf: String,
+}
+
+async fn merge_submit(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((owner, name, num)): Path<(String, String, i32)>,
+    Form(form): Form<CsrfOnly>,
+) -> Response {
+    let (repo, role, user) = match repo_and_role(&state, &headers, &owner, &name).await {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    let Some(user) = user else {
+        return Redirect::to("/login").into_response();
+    };
+    if role != Some(Role::Write) {
+        return error_page(&state, "you need write access to merge");
+    }
+    if !csrf_ok(&state, &headers, &form._csrf) {
+        return error_page(&state, "invalid CSRF token");
+    }
+    let Some(cr) = state
+        .db
+        .get_change_request(repo.id, num)
+        .await
+        .ok()
+        .flatten()
+    else {
+        return not_found(&state, Some(&user));
+    };
+    if cr.state != "open" {
+        return Redirect::to(&format!("/{owner}/{name}/requests/{num}")).into_response();
+    }
+    let (Ok(store), Some(src), Some(tgt)) = (
+        state.stores.repo_store(&owner, &name),
+        state
+            .db
+            .get_ref(repo.id, false, &cr.source_ref)
+            .await
+            .ok()
+            .flatten(),
+        state
+            .db
+            .get_ref(repo.id, false, &cr.target_ref)
+            .await
+            .ok()
+            .flatten(),
+    ) else {
+        return error_page(&state, "cannot merge: a bookmark is missing");
+    };
+    let msg = format!("merge change request #{num}: {}", cr.title);
+    match crate::review::merge_refs(&store, &user.username, &msg, &src, &tgt) {
+        Ok(summary) if summary.conflicts.is_empty() => {
+            let hex = summary.commit.to_hex();
+            let _ = state
+                .db
+                .set_ref(repo.id, false, &cr.target_ref, &hex)
+                .await;
+            let _ = state.db.set_cr_state(cr.id, "merged").await;
+            Redirect::to(&format!("/{owner}/{name}/requests/{num}")).into_response()
+        }
+        Ok(_) => error_page(
+            &state,
+            "This merge has conflicts. Resolve them locally (chip merge, then push) — chip keeps conflicts first-class.",
+        ),
+        Err(_) => error_page(&state, "merge failed"),
+    }
 }
 
 async fn issue_web_token(db: &Db, user: &User) -> anyhow::Result<String> {

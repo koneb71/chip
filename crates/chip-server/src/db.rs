@@ -36,6 +36,47 @@ pub enum Role {
     Write,
 }
 
+#[derive(Clone, Debug)]
+pub struct ChangeRequest {
+    pub id: Uuid,
+    pub number: i32,
+    pub title: String,
+    pub body: String,
+    pub author: String,
+    pub source_ref: String,
+    pub target_ref: String,
+    pub state: String,
+    pub created_at: OffsetDateTime,
+}
+
+/// Row shape shared by CR list/detail queries.
+type CrRow = (
+    Uuid,
+    i32,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    OffsetDateTime,
+);
+
+fn cr_from_row(r: CrRow) -> ChangeRequest {
+    let (id, number, title, body, author, source_ref, target_ref, state, created_at) = r;
+    ChangeRequest {
+        id,
+        number,
+        title,
+        body,
+        author,
+        source_ref,
+        target_ref,
+        state,
+        created_at,
+    }
+}
+
 #[derive(Clone)]
 pub struct Db {
     pool: PgPool,
@@ -507,5 +548,138 @@ impl Db {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    // Change requests ------------------------------------------------------------
+
+    pub async fn create_change_request(
+        &self,
+        repo_id: Uuid,
+        author_id: Uuid,
+        title: &str,
+        body: &str,
+        source_ref: &str,
+        target_ref: &str,
+    ) -> anyhow::Result<i32> {
+        let (number,): (i32,) = sqlx::query_as(
+            "SELECT COALESCE(MAX(number), 0) + 1 FROM change_requests WHERE repo_id = $1",
+        )
+        .bind(repo_id)
+        .fetch_one(&self.pool)
+        .await?;
+        sqlx::query(
+            "INSERT INTO change_requests \
+             (id, repo_id, number, title, body, author_id, source_ref, target_ref) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(repo_id)
+        .bind(number)
+        .bind(title)
+        .bind(body)
+        .bind(author_id)
+        .bind(source_ref)
+        .bind(target_ref)
+        .execute(&self.pool)
+        .await?;
+        Ok(number)
+    }
+
+    const CR_SELECT: &'static str = "SELECT c.id, c.number, c.title, c.body, u.username, \
+         c.source_ref, c.target_ref, c.state, c.created_at \
+         FROM change_requests c JOIN users u ON u.id = c.author_id";
+
+    pub async fn list_change_requests(&self, repo_id: Uuid) -> anyhow::Result<Vec<ChangeRequest>> {
+        let sql = format!(
+            "{} WHERE c.repo_id = $1 ORDER BY c.number DESC",
+            Self::CR_SELECT
+        );
+        let rows: Vec<CrRow> = sqlx::query_as(&sql)
+            .bind(repo_id)
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows.into_iter().map(cr_from_row).collect())
+    }
+
+    pub async fn get_change_request(
+        &self,
+        repo_id: Uuid,
+        number: i32,
+    ) -> anyhow::Result<Option<ChangeRequest>> {
+        let sql = format!("{} WHERE c.repo_id = $1 AND c.number = $2", Self::CR_SELECT);
+        let row: Option<CrRow> = sqlx::query_as(&sql)
+            .bind(repo_id)
+            .bind(number)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(cr_from_row))
+    }
+
+    pub async fn set_cr_state(&self, cr_id: Uuid, state: &str) -> anyhow::Result<()> {
+        sqlx::query("UPDATE change_requests SET state = $2 WHERE id = $1")
+            .bind(cr_id)
+            .bind(state)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn add_cr_comment(
+        &self,
+        cr_id: Uuid,
+        author_id: Uuid,
+        body: &str,
+    ) -> anyhow::Result<()> {
+        sqlx::query("INSERT INTO cr_comments (id, cr_id, author_id, body) VALUES ($1, $2, $3, $4)")
+            .bind(Uuid::new_v4())
+            .bind(cr_id)
+            .bind(author_id)
+            .bind(body)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn list_cr_comments(
+        &self,
+        cr_id: Uuid,
+    ) -> anyhow::Result<Vec<(String, String, OffsetDateTime)>> {
+        let rows = sqlx::query_as(
+            "SELECT u.username, c.body, c.created_at FROM cr_comments c \
+             JOIN users u ON u.id = c.author_id WHERE c.cr_id = $1 ORDER BY c.created_at",
+        )
+        .bind(cr_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    pub async fn set_cr_review(
+        &self,
+        cr_id: Uuid,
+        reviewer_id: Uuid,
+        verdict: &str,
+    ) -> anyhow::Result<()> {
+        sqlx::query(
+            "INSERT INTO cr_reviews (cr_id, reviewer_id, verdict) VALUES ($1, $2, $3) \
+             ON CONFLICT (cr_id, reviewer_id) DO UPDATE SET verdict = EXCLUDED.verdict, created_at = now()",
+        )
+        .bind(cr_id)
+        .bind(reviewer_id)
+        .bind(verdict)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn list_cr_reviews(&self, cr_id: Uuid) -> anyhow::Result<Vec<(String, String)>> {
+        let rows = sqlx::query_as(
+            "SELECT u.username, r.verdict FROM cr_reviews r \
+             JOIN users u ON u.id = r.reviewer_id WHERE r.cr_id = $1 ORDER BY r.created_at",
+        )
+        .bind(cr_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
     }
 }

@@ -7,6 +7,13 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) from 1.0 onwar
 ## [Unreleased]
 
 ### Added
+- **Change requests**: propose merging one bookmark into another, review the
+  combined diff, comment, approve / request changes, and **merge from the web UI**
+  (server-side three-way merge — no working copy needed; conflicts stay
+  first-class and are surfaced instead of force-merged).
+- **Web code browser polish**: server-side **syntax highlighting** for source
+  files, sanitized **README rendering** on the repository overview, and a
+  per-file **History** view (commits that changed a file).
 - `chip repo create <url>/owner/repo [--public] [--description …]` — create a
   server-side repository from the CLI (new `CreateRepo` gRPC RPC).
 - **Push-to-create**: the first `chip push` to a repository under your own

@@ -51,6 +51,16 @@ rustls = "0.23"
 # Scaling
 dashmap = "6"
 
+# Browsing: syntax highlighting (pure-Rust regex, no C onig), markdown render
+syntect = { version = "5", default-features = false, features = [
+    "default-fancy",
+] }
+pulldown-cmark = { version = "0.12", default-features = false, features = [
+    "html",
+] }
+ammonia = "4"
+once_cell = "1"
+
 # SSH transport
 russh.workspace = true
 
