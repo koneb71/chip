@@ -12,6 +12,7 @@ use chip_core::refs::Head;
 use chip_core::repo::Repo;
 use chip_core::working_copy;
 
+mod agent;
 mod import;
 mod remote;
 mod render;
@@ -29,6 +30,15 @@ struct Cli {
     command: Command,
 }
 
+/// Output format for history/diff commands.
+#[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum OutFormat {
+    /// Human-readable (default)
+    Human,
+    /// Compact machine-readable JSON (agent-friendly)
+    Json,
+}
+
 #[derive(Subcommand)]
 enum Command {
     /// Create a new chip repository in the current directory
@@ -39,11 +49,35 @@ enum Command {
         message: String,
     },
     /// Show the history reachable from HEAD
-    Log,
+    Log {
+        /// One dense line per change (agent-friendly)
+        #[arg(long)]
+        oneline: bool,
+        /// Output format
+        #[arg(long, value_enum, default_value_t = OutFormat::Human)]
+        format: OutFormat,
+    },
     /// Show what changed in the working tree since the last commit
-    Status,
+    Status {
+        /// Output format
+        #[arg(long, value_enum, default_value_t = OutFormat::Human)]
+        format: OutFormat,
+    },
     /// Show a unified diff of working-tree changes
-    Diff,
+    Diff {
+        /// Per-file +/- summary only (no line content)
+        #[arg(long)]
+        stat: bool,
+        /// One `A|M|D  path` line per file
+        #[arg(long = "name-status")]
+        name_status: bool,
+        /// Include hunk line content in JSON output
+        #[arg(long)]
+        patch: bool,
+        /// Output format
+        #[arg(long, value_enum, default_value_t = OutFormat::Human)]
+        format: OutFormat,
+    },
     /// Create, move, list, or delete bookmarks (named branches)
     Bookmark {
         /// Bookmark name; omit to list all bookmarks
@@ -86,6 +120,18 @@ enum Command {
     Show {
         /// Revision to show (default: @)
         rev: Option<String>,
+        /// Per-file +/- summary only (no line content)
+        #[arg(long)]
+        stat: bool,
+        /// One `A|M|D  path` line per file
+        #[arg(long = "name-status")]
+        name_status: bool,
+        /// Include hunk line content in JSON output
+        #[arg(long)]
+        patch: bool,
+        /// Output format
+        #[arg(long, value_enum, default_value_t = OutFormat::Human)]
+        format: OutFormat,
     },
     /// Reverse the most recent operation
     Undo,
@@ -225,9 +271,14 @@ fn run() -> Result<()> {
             println!("committed {}", id.short());
             Ok(())
         }),
-        Command::Log => cmd_log(),
-        Command::Status => cmd_status(),
-        Command::Diff => cmd_diff(),
+        Command::Log { oneline, format } => cmd_log(oneline, format),
+        Command::Status { format } => cmd_status(format),
+        Command::Diff {
+            stat,
+            name_status,
+            patch,
+            format,
+        } => cmd_diff(stat, name_status, patch, format),
         Command::Bookmark { name, delete } => cmd_bookmark(name, delete),
         Command::Checkout { target, create } => with_oplog("checkout", |repo| {
             if create {
@@ -274,7 +325,13 @@ fn run() -> Result<()> {
             }
             Ok(())
         }),
-        Command::Show { rev } => cmd_show(rev),
+        Command::Show {
+            rev,
+            stat,
+            name_status,
+            patch,
+            format,
+        } => cmd_show(rev, stat, name_status, patch, format),
         Command::Undo => cmd_undo(),
         Command::Op { command } => match command {
             OpCommand::Log => cmd_op_log(),
@@ -410,8 +467,16 @@ fn cmd_init() -> Result<()> {
     Ok(())
 }
 
-fn cmd_log() -> Result<()> {
+fn cmd_log(oneline: bool, format: OutFormat) -> Result<()> {
     let repo = open()?;
+    if format == OutFormat::Json {
+        print!("{}", agent::log_json(&repo)?);
+        return Ok(());
+    }
+    if oneline {
+        print!("{}", agent::log_oneline(&repo)?);
+        return Ok(());
+    }
     let head = match repo.refs().head_commit()? {
         Some(h) => h,
         None => {
@@ -461,7 +526,7 @@ fn cmd_log() -> Result<()> {
     Ok(())
 }
 
-fn cmd_status() -> Result<()> {
+fn cmd_status(format: OutFormat) -> Result<()> {
     let repo = open()?;
     let tree = working_copy::snapshot(&repo)?;
     let base = repo
@@ -472,6 +537,10 @@ fn cmd_status() -> Result<()> {
         .map(|c| c.tree);
     let changes = diff::status(repo.store(), base.as_ref(), &tree)?;
 
+    if format == OutFormat::Json {
+        println!("{}", agent::status_json(&changes)?);
+        return Ok(());
+    }
     match repo.refs().read_head()? {
         Head::Bookmark(name) => println!("on bookmark {name}"),
         Head::Detached(id) => println!("detached at {}", id.short()),
@@ -481,7 +550,7 @@ fn cmd_status() -> Result<()> {
     Ok(())
 }
 
-fn cmd_diff() -> Result<()> {
+fn cmd_diff(stat: bool, name_status: bool, patch: bool, format: OutFormat) -> Result<()> {
     let repo = open()?;
     let tree = working_copy::snapshot(&repo)?;
     let base = repo
@@ -491,7 +560,12 @@ fn cmd_diff() -> Result<()> {
         .transpose()?
         .map(|c| c.tree);
     let diffs = diff::file_diffs(repo.store(), base.as_ref(), &tree)?;
-    println!("{}", render::render_file_diffs(&diffs));
+    match format {
+        OutFormat::Json => print!("{}", agent::diff_json(&diffs, None, patch)?),
+        OutFormat::Human if stat => print!("{}", agent::stat_text(&diffs)),
+        OutFormat::Human if name_status => print!("{}", agent::name_status_text(&diffs)),
+        OutFormat::Human => println!("{}", render::render_file_diffs(&diffs)),
+    }
     Ok(())
 }
 
@@ -610,11 +684,46 @@ fn cmd_revert(target: String) -> Result<()> {
     Ok(())
 }
 
-fn cmd_show(rev: Option<String>) -> Result<()> {
+fn cmd_show(
+    rev: Option<String>,
+    stat: bool,
+    name_status: bool,
+    patch: bool,
+    format: OutFormat,
+) -> Result<()> {
     let repo = open()?;
     let rev = rev.unwrap_or_else(|| "@".to_string());
     let id = ops::resolve_commit(&repo, &rev)?;
     let commit = repo.store().get_commit(&id)?;
+    let base_tree = commit
+        .parents
+        .first()
+        .map(|p| repo.store().get_commit(p))
+        .transpose()?
+        .map(|c| c.tree);
+    let diffs = diff::file_diffs(repo.store(), base_tree.as_ref(), &commit.tree)?;
+
+    // Machine / compact modes: no human header, just the requested view.
+    match format {
+        OutFormat::Json => {
+            let meta = agent::Meta {
+                commit: &id,
+                c: &commit,
+            };
+            print!("{}", agent::diff_json(&diffs, Some(meta), patch)?);
+            return Ok(());
+        }
+        OutFormat::Human if stat => {
+            print!("{}", agent::stat_text(&diffs));
+            return Ok(());
+        }
+        OutFormat::Human if name_status => {
+            print!("{}", agent::name_status_text(&diffs));
+            return Ok(());
+        }
+        OutFormat::Human => {}
+    }
+
     let p = render::Painter::new();
     println!(
         "{} {}  commit {}",
@@ -631,13 +740,6 @@ fn cmd_show(rev: Option<String>) -> Result<()> {
         );
     }
     println!("\n    {}\n", commit.message);
-    let base_tree = commit
-        .parents
-        .first()
-        .map(|p| repo.store().get_commit(p))
-        .transpose()?
-        .map(|c| c.tree);
-    let diffs = diff::file_diffs(repo.store(), base_tree.as_ref(), &commit.tree)?;
     println!("{}", render::render_file_diffs(&diffs));
     Ok(())
 }

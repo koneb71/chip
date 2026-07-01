@@ -599,6 +599,8 @@ dependencies = [
  "prost",
  "rpassword",
  "russh",
+ "serde",
+ "serde_json",
  "time",
  "tokio",
  "tonic",

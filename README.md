@@ -131,6 +131,21 @@ chip pull origin --rebase     # on divergence, rebase local changes onto the rem
 chip pull origin --merge      # on divergence, create a merge commit
 ```
 
+### Agent-friendly output
+
+`log`, `show`, `diff`, and `status` have token-efficient, machine-readable modes
+for AI agents (color is auto-disabled when output isn't a TTY):
+
+```sh
+chip log --oneline            # one dense line per change: @ <change> <commit> Nf +A -R  summary
+chip log --format json        # compact JSON array (change, commit, parents, author, ts, stat, summary)
+chip show <rev> --stat        # per-file +/- summary, no line content
+chip show <rev> --name-status # A|M|D  path  per file
+chip show <rev> --format json # structured diff summary; add --patch to include hunk line content
+chip diff --format json       # same, for the working tree
+chip status --format json     # working-tree changes as [{status, path}]
+```
+
 ### SSH transport
 
 Add your **public key** under "SSH keys" in the web UI, then use an `ssh://`

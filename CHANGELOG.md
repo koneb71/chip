@@ -6,6 +6,12 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) from 1.0 onwar
 
 ## [Unreleased]
 
+### Added
+- **Agent-friendly history output**: `log`/`show`/`diff`/`status` gain
+  `--oneline`, `--stat`, `--name-status`, and `--format json` (with `--patch` to
+  include hunk line content) — compact, ANSI-free, machine-readable output so AI
+  agents can read history and diffs with far fewer tokens.
+
 ## [0.0.2] — 2026-07-01
 
 ### Added

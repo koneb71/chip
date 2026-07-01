@@ -579,6 +579,16 @@ chip evolution [rev]          # a change's versions over time (across amend/reba
 <p class="muted">A <code>rev</code> may be a bookmark, tag, <code>@</code>, or a
 commit id — abbreviated ids (the 12-char prefix in <code>chip log</code>) work too.</p>
 
+<h2>Reading history (for AI agents)</h2>
+<p>History and diffs have token-efficient, machine-readable modes (color is
+auto-disabled when output isn't a terminal):</p>
+<pre>chip log --oneline            # one dense line per change
+chip log --format json        # compact JSON array of changes + stats
+chip show &lt;rev&gt; --stat         # per-file +/- summary, no line content
+chip show &lt;rev&gt; --format json  # structured diff summary (--patch adds line content)
+chip diff --format json        # same, for the working tree
+chip status --format json      # working-tree changes as [{{status, path}}]</pre>
+
 <h2>Browsing on the web</h2>
 <p>A repository's page shows its bookmarks, tags, recent changes, and a rendered
 <code>README.md</code>. From there:</p>
