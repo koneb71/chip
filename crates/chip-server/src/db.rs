@@ -561,28 +561,38 @@ impl Db {
         source_ref: &str,
         target_ref: &str,
     ) -> anyhow::Result<i32> {
-        let (number,): (i32,) = sqlx::query_as(
-            "SELECT COALESCE(MAX(number), 0) + 1 FROM change_requests WHERE repo_id = $1",
-        )
-        .bind(repo_id)
-        .fetch_one(&self.pool)
-        .await?;
-        sqlx::query(
-            "INSERT INTO change_requests \
-             (id, repo_id, number, title, body, author_id, source_ref, target_ref) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
-        )
-        .bind(Uuid::new_v4())
-        .bind(repo_id)
-        .bind(number)
-        .bind(title)
-        .bind(body)
-        .bind(author_id)
-        .bind(source_ref)
-        .bind(target_ref)
-        .execute(&self.pool)
-        .await?;
-        Ok(number)
+        // `number` is per-repo sequential. Reading MAX+1 then inserting races
+        // under concurrent creates, so retry on the UNIQUE(repo_id, number)
+        // violation (SQLSTATE 23505) with a freshly recomputed number.
+        for _ in 0..8 {
+            let (number,): (i32,) = sqlx::query_as(
+                "SELECT COALESCE(MAX(number), 0) + 1 FROM change_requests WHERE repo_id = $1",
+            )
+            .bind(repo_id)
+            .fetch_one(&self.pool)
+            .await?;
+            let res = sqlx::query(
+                "INSERT INTO change_requests \
+                 (id, repo_id, number, title, body, author_id, source_ref, target_ref) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+            )
+            .bind(Uuid::new_v4())
+            .bind(repo_id)
+            .bind(number)
+            .bind(title)
+            .bind(body)
+            .bind(author_id)
+            .bind(source_ref)
+            .bind(target_ref)
+            .execute(&self.pool)
+            .await;
+            match res {
+                Ok(_) => return Ok(number),
+                Err(sqlx::Error::Database(e)) if e.code().as_deref() == Some("23505") => continue,
+                Err(e) => return Err(e.into()),
+            }
+        }
+        anyhow::bail!("could not allocate a change-request number (too much contention)")
     }
 
     const CR_SELECT: &'static str = "SELECT c.id, c.number, c.title, c.body, u.username, \

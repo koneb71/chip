@@ -12,6 +12,7 @@ use chip_core::refs::Head;
 use chip_core::repo::Repo;
 use chip_core::working_copy;
 
+mod import;
 mod remote;
 mod render;
 mod ssh;
@@ -93,6 +94,18 @@ enum Command {
         #[command(subcommand)]
         command: OpCommand,
     },
+    /// Show the stack of changes above the trunk (first-parent chain)
+    Stack,
+    /// Show how a change evolved across amend/rebase (its commit versions)
+    Evolution {
+        /// Revision whose change to inspect (default: @)
+        rev: Option<String>,
+    },
+    /// Import history from another VCS
+    Import {
+        #[command(subcommand)]
+        command: ImportCommand,
+    },
     /// Create an account on a chip server and store its token
     Register {
         /// Server endpoint, e.g. http://localhost:8080
@@ -168,6 +181,17 @@ enum RepoCommand {
         /// Optional one-line description
         #[arg(long)]
         description: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum ImportCommand {
+    /// Import a local Git repository into a new chip repository
+    Git {
+        /// Path to a local Git repository (clone remotes with `git clone` first)
+        src: String,
+        /// Target directory (defaults to the repo's name)
+        dir: Option<String>,
     },
 }
 
@@ -254,6 +278,11 @@ fn run() -> Result<()> {
         Command::Undo => cmd_undo(),
         Command::Op { command } => match command {
             OpCommand::Log => cmd_op_log(),
+        },
+        Command::Stack => cmd_stack(),
+        Command::Evolution { rev } => cmd_evolution(rev),
+        Command::Import { command } => match command {
+            ImportCommand::Git { src, dir } => import::import_git(&src, dir),
         },
         Command::Register {
             url,
@@ -648,6 +677,77 @@ fn cmd_op_log() -> Result<()> {
             op.seq,
             format_time(op.timestamp),
             op.description
+        );
+    }
+    Ok(())
+}
+
+fn cmd_stack() -> Result<()> {
+    let repo = open()?;
+    let store = repo.store();
+    let head = repo
+        .refs()
+        .head_commit()?
+        .context("no commits yet — nothing to stack")?;
+    // Trunk base: the merge-base with `main` (when we're not already on it).
+    let base = match repo
+        .refs()
+        .read_bookmark(chip_core::repo::DEFAULT_BOOKMARK)?
+    {
+        Some(m) if m != head => dag::merge_base(store, head, m)?,
+        _ => None,
+    };
+    // Walk the first-parent chain from HEAD down to (but not including) the base.
+    let mut chain = Vec::new();
+    let mut cur = Some(head);
+    while let Some(id) = cur {
+        if Some(id) == base {
+            break;
+        }
+        let c = store.get_commit(&id)?;
+        cur = c.parents.first().copied();
+        chain.push((id, c));
+        if base.is_none() && chain.len() >= 20 {
+            break;
+        }
+    }
+    if chain.is_empty() {
+        println!("stack is empty — HEAD is at the trunk.");
+        return Ok(());
+    }
+    println!("stack — {} change(s), tip first:", chain.len());
+    for (i, (id, c)) in chain.iter().enumerate() {
+        let marker = if i == 0 { "@" } else { "·" };
+        println!(
+            "  {marker} {}  {}  {}",
+            c.change_id,
+            id.short(),
+            c.message.lines().next().unwrap_or("")
+        );
+    }
+    Ok(())
+}
+
+fn cmd_evolution(rev: Option<String>) -> Result<()> {
+    let repo = open()?;
+    let rev = rev.unwrap_or_else(|| "@".to_string());
+    let commit_id = ops::resolve_commit(&repo, &rev)?;
+    let change_id = repo.store().get_commit(&commit_id)?.change_id;
+    let edges = chip_core::evolution::read(&repo)?;
+    let versions = chip_core::evolution::versions_for(&edges, &change_id);
+    println!("change {change_id}");
+    if versions.is_empty() {
+        println!("  {}  (current — no recorded rewrites)", commit_id.short());
+        return Ok(());
+    }
+    let last = versions.len() - 1;
+    for (i, (id, ts)) in versions.iter().enumerate() {
+        let label = if i == last { "current" } else { "superseded" };
+        println!(
+            "  v{}  {}  {}  ({label})",
+            i + 1,
+            id.short(),
+            format_time(*ts)
         );
     }
     Ok(())

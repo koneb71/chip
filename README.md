@@ -108,6 +108,9 @@ chip amend [-m msg]           # rewrite the current change, keeping its change-i
 chip resolve                  # clear resolved conflict markers (keeps change-id)
 chip undo                     # reverse the last operation (any command)
 chip op log                   # list recorded operations
+chip stack                    # show the stack of changes above the trunk
+chip evolution [rev]          # how a change evolved across amend/rebase (its versions)
+chip import git <path> [dir]  # import a local Git repo's history into a new chip repo
 
 # Remotes — HTTP (token) or SSH (key)
 chip register <url> -u alice -e a@x.com   # HTTP; password prompted if -p omitted

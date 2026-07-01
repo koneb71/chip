@@ -7,6 +7,14 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) from 1.0 onwar
 ## [Unreleased]
 
 ### Added
+- **Git import**: `chip import git <path> [dir]` imports a local Git repository's
+  history into a new chip repo — Git blobs/trees/commits map to chip objects with
+  author, message, timestamp, parents, branches (→ bookmarks) and tags preserved
+  (fresh change-ids; content re-hashed with BLAKE3). Pure-Rust (`gix`), no C deps.
+- **Stacked changes & evolution** (CLI): `chip stack` visualizes the chain of
+  changes above the trunk; `chip evolution [rev]` shows a change's commit versions
+  over time (recorded automatically on `amend`/`rebase`, since the change-id stays
+  stable while the commit hash moves).
 - **Change requests**: propose merging one bookmark into another, review the
   combined diff, comment, approve / request changes, and **merge from the web UI**
   (server-side three-way merge — no working copy needed; conflicts stay

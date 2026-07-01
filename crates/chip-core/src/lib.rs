@@ -10,6 +10,7 @@ pub mod change;
 pub mod dag;
 pub mod diff;
 pub mod error;
+pub mod evolution;
 pub mod hash;
 pub mod merge;
 pub mod object;

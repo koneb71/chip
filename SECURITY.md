@@ -63,8 +63,12 @@ fix. They are tracked in [`deny.toml`](deny.toml) with rationale:
 - **RUSTSEC-2025-0141 (`bincode` 1.x, unmaintained).** Stable, and it defines the
   on-disk object encoding; a 2.x migration changes the format and is tracked
   separately, not as a security fix.
-- **RUSTSEC-2025-0134 (`rustls-pemfile`, unmaintained).** Transitive; superseded by
-  `rustls-pki-types` and drops out on the next TLS-stack bump.
+- **RUSTSEC-2025-0021 (`gix`, SHA-1 collision detection).** Only reached by
+  `chip import git`, which reads a **local** repository you already trust and use
+  with git — the same exposure as running git — and chip re-hashes all imported
+  content with BLAKE3. No fixed `gix` release exists.
+- **RUSTSEC-2025-0140 (`gix-date`, non-UTF8 `TimeBuf::as_str`).** A date-formatting
+  edge on the same import-only code path; no data-integrity impact.
 
 ## Built-in hardening
 

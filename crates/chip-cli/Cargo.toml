@@ -27,3 +27,7 @@ tower = { version = "0.5", features = ["util"] }
 hyper.workspace = true
 hyper-util = { version = "0.1", features = ["tokio"] }
 dirs = "5"
+# Git import (pure-Rust; no network features → no C/TLS deps). Local repos only.
+gix = { version = "0.66", default-features = false, features = [
+    "max-performance-safe",
+] }

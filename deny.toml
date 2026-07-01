@@ -16,9 +16,14 @@ ignore = [
     # encoding, so a 2.x migration is a deliberate, format-affecting change
     # tracked separately, not a security fix.
     "RUSTSEC-2025-0141",
-    # rustls-pemfile unmaintained (folded into rustls-pki-types); transitive,
-    # no behavior impact. Drops out on the next TLS-stack bump.
-    "RUSTSEC-2025-0134",
+    # gix (gitoxide) does not detect SHA-1 collision attacks. Only reached by
+    # `chip import git`, which reads a *local* repo the user already trusts and
+    # uses with git — same exposure as git itself — and chip re-hashes all
+    # content with BLAKE3. No fixed gix release exists. See SECURITY.md.
+    "RUSTSEC-2025-0021",
+    # gix-date TimeBuf::as_str can yield non-UTF8 — a date-formatting edge on the
+    # same import-only path; no data-integrity impact. No fixed release.
+    "RUSTSEC-2025-0140",
 ]
 
 [licenses]

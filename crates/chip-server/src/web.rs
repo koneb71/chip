@@ -2091,19 +2091,27 @@ async fn request_detail(
         .await
         .ok()
         .flatten();
-    let tree_of = |s: &ObjectStore, hex: &str| -> Option<ObjectId> {
-        ObjectId::from_str(hex)
+    // Show what the CR *introduces*: a three-dot diff (merge-base → source), so
+    // commits that landed on the target after branching don't show as deletions.
+    let tree_of = |s: &ObjectStore, id: &ObjectId| -> Option<ObjectId> {
+        s.get_commit(id).ok().map(|c| c.tree)
+    };
+    let cr_diff = |s: &ObjectStore, src_hex: &str, tgt_hex: &str| -> Option<String> {
+        let src_id = ObjectId::from_str(src_hex).ok()?;
+        let tgt_id = ObjectId::from_str(tgt_hex).ok()?;
+        let src_tree = tree_of(s, &src_id)?;
+        // Base = merge-base tree (falls back to the target tree, then empty).
+        let base_tree = dag::merge_base(s, src_id, tgt_id)
             .ok()
-            .and_then(|c| s.get_commit(&c).ok())
-            .map(|c| c.tree)
+            .flatten()
+            .and_then(|b| tree_of(s, &b))
+            .or_else(|| tree_of(s, &tgt_id));
+        let diffs = diff::file_diffs(s, base_tree.as_ref(), &src_tree).ok()?;
+        Some(render_diff_html(&diffs))
     };
     let diff_html = match (store.as_ref(), &src, &tgt) {
-        (Some(s), Some(src), Some(tgt)) => match (tree_of(s, src), tree_of(s, tgt)) {
-            (Some(st), Some(tt)) => diff::file_diffs(s, Some(&tt), &st)
-                .map(|d| render_diff_html(&d))
-                .unwrap_or_else(|_| "<p class=\"muted\">Diff unavailable.</p>".into()),
-            _ => "<p class=\"muted\">Diff unavailable.</p>".into(),
-        },
+        (Some(s), Some(src), Some(tgt)) => cr_diff(s, src, tgt)
+            .unwrap_or_else(|| "<p class=\"muted\">Diff unavailable.</p>".into()),
         _ => "<p class=\"muted\">Diff unavailable (a bookmark may have been deleted).</p>".into(),
     };
 

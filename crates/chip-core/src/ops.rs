@@ -51,6 +51,8 @@ pub fn amend(repo: &Repo, message: Option<&str>) -> Result<ObjectId> {
     };
     let id = repo.store().put_commit(commit)?;
     repo.refs().move_head_to(id, DEFAULT_BOOKMARK)?;
+    // Record that this change moved from the old commit to the new one.
+    let _ = crate::evolution::record(repo, &old.change_id, head, id);
     Ok(id)
 }
 
@@ -239,7 +241,10 @@ pub fn rebase(repo: &Repo, dest: &str) -> Result<MergeOutcome> {
             message: c.message.clone(),
             conflicts: result.conflicts,
         };
-        onto = store.put_commit(commit)?;
+        let new_id = store.put_commit(commit)?;
+        // Each replayed change moves from its old commit to the rebased one.
+        let _ = crate::evolution::record(repo, &c.change_id, cid, new_id);
+        onto = new_id;
     }
 
     let final_tree = store.get_commit(&onto)?.tree;
